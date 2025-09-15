@@ -1,0 +1,24 @@
+# Interfaces do OVS a vigiar (saída do switch s1)
+interfaces:
+  - s1-eth1   # lado GCS
+  - s1-eth2   # lado UAV
+
+# Período de varredura (segundos)
+poll_seconds: 2
+
+# Perfis de filas por porta (Queue 0=C2, Queue 1=ISR)
+qos_profiles:
+  baseline:
+    q0_min: 2000000     # 2 Mbps
+    q0_max: 5000000     # 5 Mbps
+    q1_min: 500000      # 0.5 Mbps
+    q1_max: 98000000    # ~98 Mbps (restante)
+  degraded:
+    q0_min: 4000000     # 4 Mbps (reforça C2)
+    q0_max: 8000000     # 8 Mbps
+    q1_min: 200000      # 0.2 Mbps
+    q1_max: 5000000     # 5 Mbps (aperta ISR)
+
+# Modo de detecção:
+#  - "netem": considera degradado se tc qdisc netem existir na interface
+detection_mode: netem
