@@ -20,5 +20,7 @@ qos_profiles:
     q1_max: 5000000     # 5 Mbps (aperta ISR)
 
 # Modo de detecção:
-#  - "netem": considera degradado se tc qdisc netem existir na interface
-detection_mode: netem
+# - "netem": considera degradado se tc qdisc netem existir na interface
+# - "kpi": 
+# - "kpi_or_netem"
+detection_mode: kpi

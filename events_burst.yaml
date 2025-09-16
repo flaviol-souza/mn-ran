@@ -1,0 +1,29 @@
+# BURST: “pulsos” de perda/jitter curtos sem limitar a taxa
+# Duração total sugerida: ~100 s
+
+# 1º pulso (para o UAV)
+- at: 20.0
+  iface: s1-eth3
+  netem: { delay_ms: 30, jitter_ms: 5, loss_pct: 5 }
+
+- at: 30.0
+  iface: s1-eth3
+  clear: true
+
+# 2º pulso (para o GCS)
+- at: 50.0
+  iface: s1-eth2
+  netem: { delay_ms: 30, jitter_ms: 5, loss_pct: 5 }
+
+- at: 55.0
+  iface: s1-eth2
+  clear: true
+
+# 3º pulso (mais curto, de volta ao UAV)
+- at: 80.0
+  iface: s1-eth3
+  netem: { delay_ms: 20, jitter_ms: 5, loss_pct: 3 }
+
+- at: 85.0
+  iface: s1-eth3
+  clear: true

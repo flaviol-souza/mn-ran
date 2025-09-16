@@ -127,10 +127,15 @@ def run_events(events_file: str, iface_map: dict, start_time: float):
     info(f'*** Scheduler de eventos: {len(events)} eventos\n')
     for ev in events:
         t = float(ev.get('at', 0))
-        target = ev.get('target')
-        intf = iface_map.get(target)
+
+        # aceitar 'target' (preferência) ou 'iface' (compatibilidade)
+        if 'target' in ev:
+            intf = iface_map.get(ev.get('target'))
+        else:
+            intf = ev.get('iface')
+
         if not intf:
-            info(f'*** [WARN] target {target} não mapeado, ignorando.\n')
+            info(f'*** [WARN] evento sem target/iface mapeado: {ev}\n')
             continue
 
         # Espera até o tempo do evento

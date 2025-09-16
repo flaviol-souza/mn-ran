@@ -46,8 +46,6 @@ Queue 1: ISR (best-effort)
 
 ````
 
----
-
 ## 1) Requirements
 
 **On the host (Ubuntu 22.04+):**
@@ -74,7 +72,6 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-{base,good,ugly}
 
 **QGroundControl:** install the AppImage or Flatpak on the **host** (we recommend running QGC on the host instead of inside Mininet).
 
----
 
 ## 2) Start the testbed (three terminals)
 
@@ -92,7 +89,6 @@ sudo fuser -k 6653/tcp
 
 **What it does:** starts the SDN control plane. It will learn MACs/ports, classify C2 (UDP/14550 or DSCP EF=46) to **Queue 0**, and run the policy loop (baseline↔degraded) based on events.
 
----
 
 ### Terminal B — **Mininet + OVS (host)**
 
@@ -102,6 +98,7 @@ xhost +SI:localuser:root
 
 # Launch the UCV topology with CLI and the event scheduler
 sudo python3 ucv.py --ctrl_port 6653 --start_cli --events events.yaml
+#sudo python3 ucv.py --ctrl_port 6653 --start_cli --events events_congest.yaml
 ```
 
 **What it does:**
