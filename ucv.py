@@ -108,7 +108,7 @@ def run_events(events_file: str, iface_map: dict, start_time: float):
     Lê events.yaml e aplica netem/cortes conforme timeline.
     Formato exemplo:
       - at: 15.0
-        target: ucv_to_uav     # mapeia para interface s1-eth2
+        target: ucv_to_uav     # mapeia para interface s1-eth3
         netem:
           delay_ms: 80
           jitter_ms: 20
@@ -175,13 +175,23 @@ def main():
     info('*** Adicionando switch (UCV/OVS)\n')
     s1 = net.addSwitch('s1', protocols='OpenFlow13')
 
+    # depois de criar s1
+    root = net.addHost('root', inNamespace=False)
+    net.addLink(root, s1)
+    root.setIP('10.0.0.254/24', intf='root-eth0')
+
     info('*** Criando links (TCLink)\n')
     # Links com atraso inicial; banda nominal controlada por OVS/queues em egress
-    net.addLink(gcs, s1, bw=args.bw, delay=args.delay)  # gcs-eth0 <-> s1-eth1
-    net.addLink(uav, s1, bw=args.bw, delay=args.delay)  # uav-eth0 <-> s1-eth2
+    net.addLink(gcs, s1, bw=args.bw, delay=args.delay)  # gcs-eth0 <-> s1-eth2
+    net.addLink(uav, s1, bw=args.bw, delay=args.delay)  # uav-eth0 <-> s1-eth3
 
     info('*** Iniciando rede\n')
     net.start()
+
+    root = net.get('root')
+    root.cmd('ip addr flush dev root-eth0')
+    root.cmd('ip addr add 10.0.0.254/24 dev root-eth0')
+    root.cmd('ip link set root-eth0 up')
 
     # --- QoS no OVS (duas filas) ---
     info('*** Configurando QoS/Queues no OVS\n')
@@ -193,7 +203,7 @@ def main():
         q1_min=500_000,     # ISR mínimo
         q1_max=int(args.bw * 1_000_000) - 2_000_000
     )
-    apply_qos_ovs('s1', ['s1-eth1', 's1-eth2'], rates)
+    apply_qos_ovs('s1', ['s1-eth2', 's1-eth3'], rates)
 
     # --- Marcação DSCP para C2 (no UAV e no GCS) ---
     info('*** Marcando DSCP EF (46) para tráfego C2 (UDP/14550)\n')
@@ -206,8 +216,8 @@ def main():
 
     # --- Mapeamento de interfaces para eventos ---
     iface_map = {
-        'ucv_to_gcs': 's1-eth1',
-        'ucv_to_uav': 's1-eth2',
+        'ucv_to_gcs': 's1-eth2',
+        'ucv_to_uav': 's1-eth3',
         # você pode adicionar alvos extras aqui
     }
 

@@ -73,7 +73,7 @@ class UcvController(app_manager.RyuApp):
         self.policy_path = os.environ.get("UCV_POLICY", "policy.yaml")
         self.policy = load_policy(self.policy_path)
         self.detection_mode = self.policy.get("detection_mode", "netem")
-        self.interfaces = self.policy.get("interfaces", ["s1-eth1", "s1-eth2"])
+        self.interfaces = self.policy.get("interfaces", ["s1-eth2", "s1-eth3"])
         self.qos_profiles = self.policy.get("qos_profiles", {})
         self.poll_seconds = int(self.policy.get("poll_seconds", 2))
         self._policy_stop = False
@@ -141,6 +141,17 @@ class UcvController(app_manager.RyuApp):
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         self.add_flow(dp, 0, match, actions)
+
+        # ARP -> NORMAL (prioridade 50)
+        match = parser.OFPMatch(eth_type=0x0806)
+        actions = [parser.OFPActionOutput(ofp.OFPP_NORMAL)]
+        self.add_flow(dp, 50, match, actions, idle=0, hard=0)
+
+        # ICMP -> NORMAL (prioridade 40)
+        match = parser.OFPMatch(eth_type=0x0800, ip_proto=1)
+        actions = [parser.OFPActionOutput(ofp.OFPP_NORMAL)]
+        self.add_flow(dp, 40, match, actions, idle=0, hard=0)
+
 
     def add_flow(self, datapath, priority, match, actions, idle=30, hard=60):
         ofp = datapath.ofproto

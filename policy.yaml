@@ -1,7 +1,7 @@
 # Interfaces do OVS a vigiar (saída do switch s1)
 interfaces:
-  - s1-eth1   # lado GCS
-  - s1-eth2   # lado UAV
+  - s1-eth2   # lado GCS
+  - s1-eth3   # lado UAV
 
 # Período de varredura (segundos)
 poll_seconds: 2
