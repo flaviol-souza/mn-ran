@@ -1,145 +1,120 @@
+```markdown
 # UCV SDN Testbed for UAS C2/ISR KPI Experiments
 
-This repository provides a **Mininet + OVS** emulation of a **UAV Control Vehicle (UCV)** that prioritizes **C2 (MAVLink/UDP 14550)** over **ISR best-effort** traffic, with a **Ryu** controller and an **event scheduler** that injects controlled impairments (delay/jitter/loss/rate) via `tc netem`.
-
-- **Control plane:** Ryu (`controller.py`) programs OVS (OpenFlow 1.3), classifies C2 to **Queue 0**, ISR to **Queue 1**, and can shift QoS min/max between **baseline** and **degraded** profiles.
-- **Data plane:** Mininet topology `gcs — s1(OVS) — uav` with HTB queues per port.
-- **Events:** `events.yaml` applies/clears netem on OVS ports over time.
-- **KPIs:** `tshark` pcaps + scripts to extract OWD/jitter for C2 and loss/jitter for RTP (if used).
-
-
-Control Plane (decisions)
-+-----------------------+        OpenFlow TCP/6653        +-----------+
-|   Ryu (UcvController) | <-----------------------------> |  OVS s1   |
-+-----------------------+                                  +-----------+
-
-
-Data Plane (mission packets)
-+-----+      link1       +-----------+       link2       +-----+
-| GCS | <--------------> |   OVS s1  | <--------------> | UAV |
-+-----+                   +-----------+                   +-----+
-    ^                         ^    ^                          ^
-    |                         |    |                          |
-    |         (per-port queues)    |        (per-port queues) |
-    |              s1-eth-GCS      |             s1-eth-UAV   |
-    +------------------------------+--------------------------+
-
-Notes:
-- “per-port queues” = HTB queues (Queue 0 = C2 priority, Queue 1 = ISR).
-- Interface names (e.g., s1-eth-GCS / s1-eth-UAV) may be s1-eth2 / s1-eth3 depending on the run.
-
-
-## 0) Topology at a glance
-
-```
-     (host)                    (Mininet namespace)
-```
-
-\[root-eth0 10.0.0.254] <---> \[ s1 (OVS) ] <---> \[gcs 10.0.0.1]
-\|               \[uav 10.0.0.2]
-|\_ s1-eth1: root-eth0
-|\_ s1-eth2: gcs
-|\_ s1-eth3: uav
-Queues (HTB) per user port:
-Queue 0: C2 (priority, min-rate guaranteed)
-Queue 1: ISR (best-effort)
-
-````
-
-## 1) Requirements
-
-**On the host (Ubuntu 22.04+):**
-```bash
-# Base packages
-sudo apt-get update
-sudo apt-get install -y mininet openvswitch-switch iproute2 python3-venv \
-                        tshark xterm
-
-# (Recommended) Ryu in Python 3.9 virtualenv (Ryu is happiest on 3.9)
-python3.9 -m venv ~/venv-ryu39
-source ~/venv-ryu39/bin/activate
-pip install --upgrade pip setuptools wheel
-# Ryu build known-good combo for Py3.9
-pip install "ryu @ git+https://github.com/faucetsdn/ryu@master" \
-            eventlet==0.31.1 packaging==20.9 tinyrpc==1.0.4
-````
-
-**Optional (for RTP tests):**
-
-```bash
-sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-{base,good,ugly}
-```
-
-**QGroundControl:** install the AppImage or Flatpak on the **host** (we recommend running QGC on the host instead of inside Mininet).
-
-
-## 2) Start the testbed (three terminals)
-
-> Replace paths if your venv name differs.
-
-### Terminal A — **Ryu controller (host)**
-
-```bash
-source ~/venv-ryu39/bin/activate
-# (Optional) free the OF port if reused
-sudo fuser -k 6653/tcp
-# Run controller
-~/venv-ryu39/bin/ryu-manager --ofp-tcp-listen-port 6653 controller.py --verbose
-```
-
-**What it does:** starts the SDN control plane. It will learn MACs/ports, classify C2 (UDP/14550 or DSCP EF=46) to **Queue 0**, and run the policy loop (baseline↔degraded) based on events.
-
-
-### Terminal B — **Mininet + OVS (host)**
-
-```bash
-# Allow root namespaces to open X apps (xterm) if needed
-xhost +SI:localuser:root
-
-# Launch the UCV topology with CLI and the event scheduler
-sudo python3 ucv.py --ctrl_port 6653 --start_cli --events events.yaml
-#sudo python3 ucv.py --ctrl_port 6653 --start_cli --events events_congest.yaml
-```
-
-**What it does:**
-
-* creates `gcs`, `uav`, switch `s1` (OVS), and a **host root port** `root-eth0` on the bridge.
-* configures **HTB QoS/Queues** on `s1-eth2` (gcs) and `s1-eth3` (uav).
-* marks **DSCP EF(46)** for UDP/14550 on both hosts (C2).
-* applies **OpenFlow13** on the bridge.
-* starts the **event scheduler** per `events.yaml`.
-
-After the topology comes up, in the **Mininet CLI** (`mininet>`), **verify the host-root interface**:
-
-```bash
-mininet> sh ip -br addr show root-eth0
-# If needed, force the IP:
-mininet> sh ip addr flush dev root-eth0
-mininet> sh ip addr add 10.0.0.254/24 dev root-eth0
-mininet> sh ip link set root-eth0 up
-```
-
-> **Why 10.0.0.254?** We connect the host (where QGC runs) to the Mininet L2 domain through `root-eth0` so all QGC↔PX4 traffic still traverses **s1/OVS** (and its queues).
+This repository emulates a **UAV Control Vehicle (UCV)** with **Mininet + Open vSwitch (OVS)** and a **Ryu** SDN controller to prioritize **C2 (MAVLink/UDP 14550)** over **ISR best-effort** traffic.  
+An **event scheduler** injects controlled degradations (delay/jitter/loss/rate) via `tc netem`.  
+A new `scripts/analyze.sh` extracts **C2 OWD/jitter** **without requiring the MAVLink dissector** (parses payload) and, if present, summarizes **RTP** streams.
 
 ---
 
-### Terminal C — **Proactive OpenFlow (host)**
+## Architecture
 
-Install two **proactive flows** so the very first C2 packets already have a path and priority (Queue 0):
+**Control Plane (decisions)**
+```
+
++-----------------------+        OpenFlow TCP/6653        +-----------+
+\|   Ryu (UcvController) | <-----------------------------> |  OVS s1   |
++-----------------------+                                  +-----------+
+
+```
+
+**Data Plane (mission packets)**
+```
+
++-----+      link GCS       +-----------+       link UAV       +-----+
+\| GCS | <-----------------> |   OVS s1  | <-----------------> | UAV |
++-----+                      +-----------+                      +-----+
+^                             ^     ^                          ^
+\|                             |     |                          |
+\|       (per-port HTB queues) |     |       (per-port HTB queues)
+\|              s1-eth-GCS     |     |             s1-eth-UAV
++-----------------------------+-----+-----------------------------+
+
+````
+
+> A porta **`root-eth0`** no host é conectada à bridge `s1` (criada pelo Mininet). O **QGC roda no host**, e o **PX4 SITL** roda no host **dentro do namespace `uav`** do Mininet.  
+> **Fila 0** = C2 priorizado; **Fila 1** = ISR best-effort (HTB).
+
+---
+
+## Requirements (host)
 
 ```bash
-# C2 UDP → Queue 0 + L2 bridging (both dst and src 14550)
+sudo apt-get update
+sudo apt-get install -y mininet openvswitch-switch iproute2 \
+                        tshark xterm \
+                        python3-venv
+# (Opcional para testes de vídeo RTP)
+sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-{base,good,ugly}
+````
+
+**Known-good Ryu on Python 3.9**
+
+```bash
+python3.9 -m venv ~/venv-ryu39
+source ~/venv-ryu39/bin/activate
+pip install --upgrade pip setuptools wheel
+pip install "ryu @ git+https://github.com/faucetsdn/ryu@master" \
+            eventlet==0.31.1 packaging==20.9 tinyrpc==1.0.4
+```
+
+> Para capturar com `tshark` sem `sudo`:
+> `sudo dpkg-reconfigure wireshark-common` e adicione seu usuário ao grupo `wireshark` (deslogar/logar).
+> **Não é necessário o dissector MAVLink** para análise; o script novo parseia o payload.
+
+---
+
+## Files you will use
+
+* `controller.py` – Ryu app (classificação C2, filas HTB, políticas baseline/degraded, loop por KPI/netem, regras proativas opcionais).
+* `ucv.py` – constrói topologia Mininet (GCS, UAV, OVS s1, root-eth0), aplica QoS/queues e agenda eventos netem de `events*.yaml`.
+* `policy.yaml` – interfaces monitoradas, perfis de QoS, modo de detecção (`netem`, `kpi`, `kpi_or_netem`).
+* `events.yaml` / `events_lowloss.yaml` / `events_congest.yaml` / `events_burst.yaml` – perfis de degradação.
+* `scripts/analyze.sh` – **novo analisador** (bash) que **não depende do dissector** MAVLink; gera KPIs e `report.md`.
+
+> Execute `scripts/*.sh` sempre com **bash** (não `sh`), pois usam `set -o pipefail`.
+
+---
+
+## Quick start (3 terminals)
+
+### Terminal A — Ryu controller (host)
+
+```bash
+source ~/venv-ryu39/bin/activate
+sudo fuser -k 6653/tcp 2>/dev/null || true
+~/venv-ryu39/bin/ryu-manager --ofp-tcp-listen-port 6653 controller.py --verbose
+```
+
+### Terminal B — Mininet + OVS (host)
+
+```bash
+xhost +SI:localuser:root      # permite janelas X para namespaces root (xterm)
+sudo python3 ucv.py --ctrl_port 6653 --start_cli --events events.yaml
+```
+
+No prompt `mininet>`:
+
+```bash
+# Garanta IP/UP no host-port ligado à bridge s1
+mininet> sh ip addr add 10.0.0.254/24 dev root-eth0 || true
+mininet> sh ip link set root-eth0 up
+# (Opcional) ver links/nomes de portas:
+mininet> links
+```
+
+### Terminal C — Regras proativas (host)
+
+Para que os **primeiros pacotes** C2 já tenham caminho/priority:
+
+```bash
 sudo ovs-ofctl -O OpenFlow13 add-flow s1 "priority=60,udp,tp_dst=14550,actions=set_queue:0,NORMAL"
 sudo ovs-ofctl -O OpenFlow13 add-flow s1 "priority=60,udp,tp_src=14550,actions=set_queue:0,NORMAL"
-
-# Also ensure ARP/ICMP forwarding (if not already installed by the controller)
 sudo ovs-ofctl -O OpenFlow13 add-flow s1 "priority=50,arp,actions=NORMAL"
 sudo ovs-ofctl -O OpenFlow13 add-flow s1 "priority=40,icmp,actions=NORMAL"
 ```
 
-**What it does:** guarantees immediate L2 path for MAVLink and prioritizes it from the first packet. The controller will still install learned flows for finer matches.
-
-**Check:**
+Verifique:
 
 ```bash
 sudo ovs-ofctl -O OpenFlow13 dump-flows s1 | egrep 'tp_(src|dst)=14550|arp|icmp|set_queue'
@@ -147,184 +122,383 @@ sudo ovs-ofctl -O OpenFlow13 dump-flows s1 | egrep 'tp_(src|dst)=14550|arp|icmp|
 
 ---
 
-## 3) PX4 + QGC (C2 “real”)
+## Run PX4 and QGC
 
-### 3.1 Start PX4 SITL on **uav** (in Mininet)
-
-From the **Mininet CLI**:
+### Iniciar PX4 SITL no `uav` (dentro do Mininet)
 
 ```bash
 mininet> xterm uav
 ```
 
-In the `uav` xterm:
+No xterm:
 
 ```bash
 cd ~/PX4-Autopilot
-# First time: git submodule update --init --recursive
-make px4_sitl jmavsim           # or HEADLESS=1 make px4_sitl jmavsim
-```
-
-Configure MAVLink to send to the **host** IP on `root-eth0`:
-Inside the PX4 console (`pxh>`):
-
-```text
+make px4_sitl jmavsim          # ou HEADLESS=1 make px4_sitl jmavsim
+# pxh>
 mavlink stop-all
-mavlink start -x -u 14550 -r 50 -t 10.0.0.254 -p
-mavlink status   # partner: 10.0.0.254, tx increasing
+mavlink start -x -u 14550 -r 20 -t 10.0.0.254 -p
+mavlink status                 # partner: 10.0.0.254:14550; contadores TX subindo
 ```
 
-### 3.2 Start **QGroundControl** on the **host**
+### Rodar QGroundControl no host
 
-Run QGC (AppImage or Flatpak) normally on the host. It should auto-detect the UDP stream on 14550.
-Check the host is listening:
+Abra o QGC normalmente. Ele deve detectar o fluxo UDP/14550.
+Checar no host:
 
 ```bash
 ss -lun | grep 14550
-# and observe packets arriving:
-sudo tcpdump -ni root-eth0 udp port 14550
-```
-
-> If QGC doesn’t auto-connect, add a **UDP Comm Link** listening on port **14550**.
-
----
-
-## 4) Optional: Synthetic ISR traffic and packet capture (inside Mininet)
-
-On the **Mininet CLI** (`mininet>`):
-
-```bash
-# Start iperf servers (avoid “did not receive ack” warnings)
-gcs iperf -u -s -p 14550 &
-uav iperf -u -s -p 5004  &
-
-# Start captures (pcap files will be on each host’s /tmp)
-gcs tshark -i gcs-eth0 -f "udp port 14550 or udp port 5004" -w /tmp/gcs.pcap &
-uav tshark -i uav-eth0 -f "udp port 14550 or udp port 5004" -w /tmp/uav.pcap &
-
-# Generate traffic
-#   C2 (Queue 0): UAV -> GCS
-uav iperf -u -b 300k -c 10.0.0.1 -p 14550 &
-#   ISR (Queue 1): GCS -> UAV
-gcs iperf -u -b 8M   -c 10.0.0.2 -p 5004  &
-```
-
-Stop and exit when done:
-
-```bash
-gcs pkill tshark ; uav pkill tshark
-gcs pkill iperf  ; uav pkill iperf
-exit   # leave Mininet CLI
+sudo tcpdump -ni root-eth0 udp port 14550 -c 5
 ```
 
 ---
 
-## 5) KPI extraction
+## Packet capture (C2)
 
-**On the host (repo root):**
+> Para **PX4 → QGC (uav→host)**: capture **no host `root-eth0`** (RX) e **no `uav-eth0`** (TX).
+
+**Mininet (TX lado PX4)**
 
 ```bash
-# Copy and analyze (pcaps must exist: /tmp/gcs.pcap and /tmp/uav.pcap)
-./scripts/analyze.sh /tmp/gcs.pcap /tmp/uav.pcap
-# Output: ./logs/run_YYYYMMDD_HHMMSS/report.md
+mininet> uav tshark -i uav-eth0 -f "udp port 14550" -w /tmp/uav_c2.pcap &
 ```
 
-**Notes:**
+**Host (RX lado QGC)**
 
-* If your ISR is **RTP** (e.g., GStreamer), `tshark` will parse `-z rtp,streams`.
-  If you used generic UDP (iperf), force **Decode As RTP** when capturing:
+```bash
+sudo tshark -i root-eth0 -f "udp port 14550" -w /tmp/host_c2.pcap &
+```
 
-  ```bash
-  gcs tshark -i gcs-eth0 -d udp.port==5004,rtp -w /tmp/gcs.pcap &
-  ```
-* If your `tshark` lacks the MAVLink dissector, the script falls back to **payload-based correlation** to compute C2 OWD/jitter.
+> Para **QGC → PX4 (host→uav)**, a mesma dupla de capturas vale; você analisará invertendo a ordem dos pcaps (ver próxima seção).
+
+**(Opcional) RTP ISR**
+Se você também gerar vídeo RTP (porta 5004), capture no destino e, se quiser, force decode-as:
+
+```bash
+mininet> gcs tshark -i gcs-eth0 -d udp.port==5004,rtp -w /tmp/gcs_rtp.pcap &
+```
 
 ---
 
-## 6) Event scheduler
+## KPI extraction (novo `analyze.sh`)
 
-`events.yaml` controls **when** and **where** impairments are applied. Example:
+O script **não depende** do dissector MAVLink: ele parseia `data.data`, identifica frames MAVLink v1/v2 e casa sequências.
+
+**Instale a versão nova (bash)** de `scripts/analyze.sh`:
+
+````bash
+cat > scripts/analyze.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage: ./scripts/analyze.sh <PCAP_RX> <PCAP_TX>
+# RX = lado que RECEBE (ex.: host root-eth0 quando PX4->QGC)
+# TX = lado que ENVIA  (ex.: uav-eth0 quando PX4->QGC)
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: $0 <PCAP_RX> <PCAP_TX>"
+  exit 1
+fi
+
+PCAP_RX="$1"
+PCAP_TX="$2"
+
+command -v tshark >/dev/null 2>&1 || { echo "[ERR] tshark not found"; exit 2; }
+command -v python3 >/dev/null 2>&1 || { echo "[ERR] python3 not found"; exit 2; }
+
+ts() { date +"%Y%m%d_%H%M%S"; }
+OUTDIR="logs/run_$(ts)"
+mkdir -p "$OUTDIR"
+echo "[*] Output dir: $OUTDIR"
+
+cp -v "$PCAP_RX" "$OUTDIR/gcs.pcap" 2>/dev/null || cp -v "$PCAP_RX" "$OUTDIR/rx.pcap"
+cp -v "$PCAP_TX" "$OUTDIR/uav.pcap" 2>/dev/null || cp -v "$PCAP_TX" "$OUTDIR/tx.pcap"
+
+echo "[*] RTP streams (RX side)"
+tshark -r "$PCAP_RX" -q -d udp.port==5004,rtp -z rtp,streams > "$OUTDIR/rtp_streams.txt" || true
+
+echo "[*] C2 OWD (payload-based) ..."
+RX_TSV="$OUTDIR/c2_rx_seq.tsv"
+TX_TSV="$OUTDIR/c2_tx_seq.tsv"
+OWD_TSV="$OUTDIR/c2_owd_ms.tsv"
+JIT_TSV="$OUTDIR/c2_jitter_ms.tsv"
+REPORT="$OUTDIR/report.md"
+
+tshark -r "$PCAP_RX" -T fields -e frame.time_epoch -e data.data -Y "udp.port==14550 and data" > "$OUTDIR/rx_raw.tsv" || true
+tshark -r "$PCAP_TX" -T fields -e frame.time_epoch -e data.data -Y "udp.port==14550 and data" > "$OUTDIR/tx_raw.tsv" || true
+
+python3 - "$OUTDIR/rx_raw.tsv" > "$RX_TSV" <<'PY'
+import sys, binascii
+def seqs_from_bytes(b):
+    out=[]; i=0; n=len(b)
+    while i<n:
+        byte=b[i]
+        if byte==0xFE and i+6<=n: out.append(b[i+2]); i+=6; continue
+        if byte==0xFD and i+8<=n: out.append(b[i+4]); i+=10 if i+10<=n else 8; continue
+        i+=1
+    return out
+with open(sys.argv[1],'r') as f:
+    for ln in f:
+        p=ln.strip().split('\t')
+        if len(p)<2: continue
+        try: t=float(p[0])
+        except: continue
+        x=p[1].replace(':','')
+        if len(x)<4: continue
+        try: b=binascii.unhexlify(x)
+        except: continue
+        s=seqs_from_bytes(b)
+        if s: print(f"{t}\t{int(s[0])}")
+PY
+
+python3 - "$OUTDIR/tx_raw.tsv" > "$TX_TSV" <<'PY'
+import sys, binascii
+def seqs_from_bytes(b):
+    out=[]; i=0; n=len(b)
+    while i<n:
+        byte=b[i]
+        if byte==0xFE and i+6<=n: out.append(b[i+2]); i+=6; continue
+        if byte==0xFD and i+8<=n: out.append(b[i+4]); i+=10 if i+10<=n else 8; continue
+        i+=1
+    return out
+with open(sys.argv[1],'r') as f:
+    for ln in f:
+        p=ln.strip().split('\t')
+        if len(p)<2: continue
+        try: t=float(p[0])
+        except: continue
+        x=p[1].replace(':','')
+        if len(x)<4: continue
+        try: b=binascii.unhexlify(x)
+        except: continue
+        s=seqs_from_bytes(b)
+        if s: print(f"{t}\t{int(s[0])}")
+PY
+
+python3 - "$RX_TSV" "$TX_TSV" > "$OWD_TSV" <<'PY'
+import sys, statistics
+rx_path, tx_path = sys.argv[1], sys.argv[2]
+def load(path):
+    d={}
+    for ln in open(path):
+        if not ln.strip() or ln.startswith('#'): continue
+        t,s = ln.strip().split('\t')
+        try: t=float(t); s=int(s)
+        except: continue
+        if s not in d: d[s]=t
+    return d
+rx,tx=load(rx_path),load(tx_path)
+pairs=[]
+for s,t_tx in tx.items():
+    t_rx=rx.get(s)
+    if t_rx is None: continue
+    pairs.append((s,(t_rx-t_tx)*1000.0))
+pairs.sort(key=lambda x:x[0])
+for s,owd in pairs: print(f"{s}\t{owd:.3f}")
+if pairs:
+    arr=sorted([owd for _,owd in pairs])
+    import math
+    p50 = (arr[len(arr)//2] if len(arr)%2 else (arr[len(arr)//2-1]+arr[len(arr)//2])/2)
+    p95 = arr[max(0,int(math.floor(0.95*(len(arr)-1))))]
+    p99 = arr[max(0,int(math.floor(0.99*(len(arr)-1))))]
+    sys.stderr.write(f"# OWD: n={len(arr)} p50={p50:.1f}ms p95={p95:.1f}ms p99={p99:.1f}ms min={min(arr):.1f} max={max(arr):.1f}\n")
+else:
+    sys.stderr.write("# OWD: n=0 (no seq matches)\n")
+PY
+
+python3 - "$RX_TSV" > "$JIT_TSV" <<'PY'
+import sys, statistics, math
+ts=[]
+for ln in open(sys.argv[1]):
+    if not ln.strip() or ln.startswith('#'): continue
+    t,_=ln.strip().split('\t')
+    try: ts.append(float(t))
+    except: pass
+ts.sort()
+ia=[(ts[i]-ts[i-1])*1000.0 for i in range(1,len(ts))]
+for i,v in enumerate(ia,1): print(f"{i}\t{v:.3f}")
+if ia:
+    arr=sorted(ia)
+    p50 = (arr[len(arr)//2] if len(arr)%2 else (arr[len(arr)//2-1]+arr[len(arr)//2])/2)
+    p95 = arr[max(0,int(math.floor(0.95*(len(arr)-1))))]
+    p99 = arr[max(0,int(math.floor(0.99*(len(arr)-1))))]
+    sys.stderr.write(f"# JITTER(RX): n={len(arr)} p50={p50:.1f}ms p95={p95:.1f}ms p99={p99:.1f}ms min={min(arr):.1f} max={max(arr):.1f}\n")
+else:
+    sys.stderr.write("# JITTER(RX): n=0\n")
+PY
+
+{
+  echo "# KPI Report"
+  echo
+  echo "RX pcap: \`$PCAP_RX\`"
+  echo "TX pcap: \`$PCAP_TX\`"
+  echo
+  echo "## RTP (RX side)"
+  if [[ -s "$OUTDIR/rtp_streams.txt" ]]; then
+    echo '```'
+    sed -n '1,200p' "$OUTDIR/rtp_streams.txt"
+    echo '```'
+  else
+    echo "_no RTP streams detected (ok if you didn't stream video)_"
+  fi
+  echo
+  echo "## C2 OWD (ms) by seq"
+  if [[ -s "$OWD_TSV" ]]; then
+    echo '```'
+    head -n 20 "$OWD_TSV"
+    echo '...'
+    tail -n 5 "$OWD_TSV"
+    echo '```'
+  else
+    echo "_no OWD pairs (no matching sequences found)_"
+  fi
+  echo
+  echo "## C2 Inter-arrival Jitter at RX (ms)"
+  if [[ -s "$JIT_TSV" ]]; then
+    echo '```'
+    head -n 20 "$JIT_TSV"
+    echo '...'
+    tail -n 5 "$JIT_TSV"
+    echo '```'
+  else
+    echo "_no RX packets parsed for jitter_"
+  fi
+} > "$REPORT"
+
+echo "[OK] Report: $REPORT"
+BASH
+chmod +x scripts/analyze.sh
+````
+
+**Rodar (PX4→QGC)**
+
+```bash
+sudo ./scripts/analyze.sh /tmp/host_c2.pcap /tmp/uav_c2.pcap
+```
+
+**Rodar (QGC→PX4) — invertendo a ordem**
+
+```bash
+sudo ./scripts/analyze.sh /tmp/uav_c2.pcap /tmp/host_c2.pcap
+```
+
+Checar saídas:
+
+```bash
+LATEST=$(ls -1td logs/run_* | head -1)
+wc -l $LATEST/c2_owd_ms.tsv  $LATEST/c2_jitter_ms.tsv
+sed -n '1,80p' $LATEST/report.md
+```
+
+---
+
+## Events & policy
+
+**Exemplos de eventos**
 
 ```yaml
-- at: 10.0   # seconds
-  iface: s1-eth3   # toward UAV
-  netem: { delay_ms: 80, jitter_ms: 20, loss_pct: 2, rate_mbit: 5 }
-- at: 40.0
-  iface: s1-eth3
-  clear: true
-- at: 60.0
-  iface: s1-eth2   # toward GCS
-  netem: { delay_ms: 120, jitter_ms: 30, loss_pct: 1 }
-- at: 90.0
-  iface: s1-eth2
-  clear: true
+# events_lowloss.yaml
+- at: 10.0  ; iface: s1-ethUAV ; netem: { delay_ms: 40, jitter_ms: 10, loss_pct: 0.2, rate_mbit: 10 }
+- at: 40.0  ; iface: s1-ethUAV ; clear: true
+- at: 60.0  ; iface: s1-ethGCS ; netem: { delay_ms: 40, jitter_ms: 10, loss_pct: 0.2, rate_mbit: 10 }
+- at: 90.0  ; iface: s1-ethGCS ; clear: true
 ```
 
-**What happens:** the script applies `tc qdisc netem` to the selected interface at the requested times, then clears it. The controller’s policy loop sees “degraded” and tightens Queue 0 min/max accordingly.
+```yaml
+# events_congest.yaml
+- at: 10.0  ; iface: s1-ethUAV ; netem: { delay_ms: 120, jitter_ms: 30, loss_pct: 1, rate_mbit: 5 }
+- at: 40.0  ; iface: s1-ethUAV ; clear: true
+- at: 60.0  ; iface: s1-ethGCS ; netem: { delay_ms: 120, jitter_ms: 30, loss_pct: 1, rate_mbit: 5 }
+- at: 90.0  ; iface: s1-ethGCS ; clear: true
+```
+
+```yaml
+# events_burst.yaml
+- at: 20.0  ; iface: s1-ethUAV ; netem: { delay_ms: 30, jitter_ms: 5, loss_pct: 5 }
+- at: 30.0  ; iface: s1-ethUAV ; clear: true
+- at: 50.0  ; iface: s1-ethGCS ; netem: { delay_ms: 30, jitter_ms: 5, loss_pct: 5 }
+- at: 55.0  ; iface: s1-ethGCS ; clear: true
+```
+
+**Política (policy.yaml)**
+
+```yaml
+interfaces: [s1-eth2, s1-eth3]   # confirme com 'mininet> links'
+poll_seconds: 2
+detection_mode: kpi_or_netem     # 'netem' | 'kpi' | 'kpi_or_netem'
+qos_profiles:
+  baseline: { q0_min: 2000000, q0_max: 5000000, q1_min: 500000,  q1_max: 98000000 }
+  degraded: { q0_min: 4000000, q0_max: 8000000, q1_min: 200000,  q1_max: 5000000 }
+```
+
+> Em modo `kpi`/`kpi_or_netem`, o controlador mede KPIs (via `root-eth0`) e alterna perfis. Observe logs como:
+> `[kpi] degrade: loss=2.4% jitter_p95=65.1 ms` / `[kpi] recover: ...`.
 
 ---
 
-## 7) Useful runtime checks
+## Minimal smoke test (coleta)
 
-**Show OVS ports/ids (host):**
+1. Inicie Ryu e Mininet (com `root-eth0` up).
+2. Capturas:
+
+   * Mininet: `uav tshark -i uav-eth0 -f "udp port 14550" -w /tmp/uav_c2.pcap &`
+   * Host:    `sudo tshark -i root-eth0 -f "udp port 14550" -w /tmp/host_c2.pcap &`
+3. PX4 no `uav`: `make px4_sitl jmavsim` → `mavlink start -x -u 14550 -r 20 -t 10.0.0.254 -p`.
+4. Após \~15 s, pare capturas (uav/host).
+5. Verifique pacotes:
+   `sudo tshark -r /tmp/host_c2.pcap -Y "udp.port==14550" -c 5`
+   `mininet> uav tshark -r /tmp/uav_c2.pcap -Y "udp.port==14550" -c 5`
+6. Analise: `sudo ./scripts/analyze.sh /tmp/host_c2.pcap /tmp/uav_c2.pcap`
+   Confirme `c2_owd_ms.tsv`, `c2_jitter_ms.tsv` e `report.md` **não vazios**.
+
+---
+
+## Useful checks
 
 ```bash
+# OVS ports & link roles
 sudo ovs-ofctl -O OpenFlow13 show s1
-```
-
-**QoS/Queues per port (host, with topology UP):**
-
-```bash
+# QoS/queues por porta
 sudo ovs-appctl qos/show s1
-```
-
-**Flows that set queues or match 14550 (host):**
-
-```bash
+# Flows de priorização C2
 sudo ovs-ofctl -O OpenFlow13 dump-flows s1 | egrep 'set_queue|14550'
-```
-
-**Active netem (host):**
-
-```bash
+# Netem ativo?
 tc qdisc show dev s1-eth2
 tc qdisc show dev s1-eth3
 ```
 
 ---
 
-## 8) Troubleshooting
+## Troubleshooting
 
-* **QGC won’t run inside Mininet**: it refuses to run as root. Prefer **QGC on host** (this README’s approach).
-* **`root-eth0` missing:** only exists while Mininet is running. Start Mininet first; verify with `ip -br addr show root-eth0`.
-* **Ping works but MAVLink doesn’t:** add the **proactive flows** (Section 2, Terminal C). Without them, the first UDP/14550 packets may not get a forwarding path immediately.
-* **No RTP stats with iperf:** iperf is UDP generic. Use GStreamer to produce **RTP/RTCP**, or force “Decode As RTP” when capturing.
-* **Do not run while topology is up:**
-
-  ```bash
-  sudo ovs-vsctl -- --all destroy QoS -- --all destroy Queue
-  ```
-
-  (This deletes QoS/Queue objects; the controller can’t adjust anything afterward.)
+* **Arquivos .tsv vazios**: use a **nova** `scripts/analyze.sh` (payload-based). Confirmar que *há* pacotes nos pcaps (passo 5 do smoke test).
+* **QGC no Mininet**: não suportado (rodar no host).
+* **`root-eth0` não existe**: só existe enquanto a topologia está ativa.
+* **Sem caminho para primeiros pacotes**: adicione **regras proativas** (seção “Regras proativas”).
+* **Avisos HTB “quantum is big”**: inócuos nesse cenário; ignore ou ajuste taxas.
 
 ---
 
-## 9) Clean up
+## Clean up
 
 ```bash
-# From Mininet CLI:
-exit
-# On host, if you need to reset QoS/Queues (only after exiting Mininet):
+# dentro do Mininet:
+mininet> exit
+# opcional (após sair do Mininet): limpar QoS objetos
 sudo ovs-vsctl -- --all destroy QoS -- --all destroy Queue
 ```
 
 ---
 
-## 10) Next steps
+## Next steps
 
-* Drive the policy by **measured KPIs** (e.g., C2 OWD p95) instead of “netem present”.
-* Add **RTP ISR** pipelines (UAV→GCS) for realistic video KPIs.
-* Scale to **multi-UE** and add a second path for **fast failover/steering**.
+* Rodar matriz de cenários (`events_*`) e comparar KPIs com/sem `detection_mode: kpi_or_netem`.
+* Integrar pipelines RTP de verdade (GStreamer) e incluir RTCP.
+* Multi-UE, múltiplos caminhos e fast failover.
+* Marcação DSCP por app, QoE-aware policies e capability-based planning.
+
+---
 
 ```
+::contentReference[oaicite:0]{index=0}
 ```
