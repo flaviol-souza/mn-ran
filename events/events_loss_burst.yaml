@@ -1,0 +1,9 @@
+targets: [s1-eth2, s1-eth3]
+repeat:
+  warmup_s: 90
+  on_s: 60
+  off_s: 30
+  cycles: 4
+  netem:
+    loss_pct: 1.5
+    corr_pct: 60        # ~60% de correlação => rajadas visíveis

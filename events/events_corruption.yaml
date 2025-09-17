@@ -1,0 +1,48 @@
+- at: 90
+  iface: s1-eth2
+  netem: {corrupt_pct: 0.05}
+- at: 90
+  iface: s1-eth3
+  netem: {corrupt_pct: 0.05}
+- at: 150
+  iface: s1-eth2
+  clear: true
+- at: 150
+  iface: s1-eth3
+  clear: true
+- at: 180
+  iface: s1-eth2
+  netem: {corrupt_pct: 0.05}
+- at: 180
+  iface: s1-eth3
+  netem: {corrupt_pct: 0.05}
+- at: 240
+  iface: s1-eth2
+  clear: true
+- at: 240
+  iface: s1-eth3
+  clear: true
+- at: 270
+  iface: s1-eth2
+  netem: {corrupt_pct: 0.05}
+- at: 270
+  iface: s1-eth3
+  netem: {corrupt_pct: 0.05}
+- at: 330
+  iface: s1-eth2
+  clear: true
+- at: 330
+  iface: s1-eth3
+  clear: true
+- at: 360
+  iface: s1-eth2
+  netem: {corrupt_pct: 0.05}
+- at: 360
+  iface: s1-eth3
+  netem: {corrupt_pct: 0.05}
+- at: 420
+  iface: s1-eth2
+  clear: true
+- at: 420
+  iface: s1-eth3
+  clear: true
