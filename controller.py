@@ -324,6 +324,24 @@ class UcvController(app_manager.RyuApp):
         actions = [parser.OFPActionSetQueue(0), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
         self.add_flow(dp, 60, match, actions, idle=0, hard=0)
 
+        # UDP/5600 (Vídeo) proactive: Queue 1 + L2 NORMAL (ambos os sentidos)
+        match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_dst=5600)
+        actions = [parser.OFPActionSetQueue(1), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
+        self.add_flow(dp, 55, match, actions, idle=0, hard=0)
+
+        match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_src=5600)
+        actions = [parser.OFPActionSetQueue(1), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
+        self.add_flow(dp, 55, match, actions, idle=0, hard=0)
+
+        # RTP/5004 (Vídeo) proactive: Queue 1 + NORMAL
+        match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_dst=5004)
+        actions = [parser.OFPActionSetQueue(1), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
+        self.add_flow(dp, 55, match, actions, idle=0, hard=0)
+
+        match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_src=5004)
+        actions = [parser.OFPActionSetQueue(1), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
+        self.add_flow(dp, 55, match, actions, idle=0, hard=0)
+
 
 
     def add_flow(self, datapath, priority, match, actions, idle=30, hard=60):
