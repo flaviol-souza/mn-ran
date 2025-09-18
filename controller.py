@@ -101,7 +101,7 @@ class UcvController(app_manager.RyuApp):
         self.policy_path = os.environ.get("UCV_POLICY", "policy.yaml")
         self.policy = load_policy(self.policy_path)
         self.detection_mode = self.policy.get("detection_mode", "netem")
-        self.interfaces = self.policy.get("interfaces", ["s1-eth2", "s1-eth3"])
+        self.interfaces = self.policy.get("interfaces", ['s1-eth2', 's1-eth3', 's1-eth4', 's1-eth5'])
         self.qos_profiles = self.policy.get("qos_profiles", {})
         self.poll_seconds = int(self.policy.get("poll_seconds", 2))
         self._policy_stop = False
@@ -323,6 +323,16 @@ class UcvController(app_manager.RyuApp):
         match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_src=14550)
         actions = [parser.OFPActionSetQueue(0), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
         self.add_flow(dp, 60, match, actions, idle=0, hard=0)
+
+        # UDP/5600 (vídeo) proactive: Queue 1 + L2 NORMAL (ambos sentidos)
+        match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_dst=5600)
+        actions = [parser.OFPActionSetQueue(1), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
+        self.add_flow(dp, 55, match, actions, idle=0, hard=0)
+
+        match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_src=5600)
+        actions = [parser.OFPActionSetQueue(1), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
+        self.add_flow(dp, 55, match, actions, idle=0, hard=0)
+
 
 
 

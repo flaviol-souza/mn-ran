@@ -163,6 +163,12 @@ def main():
     parser.add_argument('--bw', type=float, default=100, help='bw nominal de cada link (Mbit/s)')
     parser.add_argument('--delay', type=str, default='10ms', help='delay inicial de cada link')
     parser.add_argument('--start_cli', action='store_true', help='iniciar CLI ao final')
+    
+    parser.add_argument('--video_relay', action='store_true', help='iniciar socat no UAV para relé de vídeo 5600 -> host')
+    parser.add_argument('--video_listen_port', type=int, default=5600)
+    parser.add_argument('--video_dest_ip', default='10.1.0.254')
+    parser.add_argument('--video_dest_port', type=int, default=5600)
+
     args = parser.parse_args()
 
     setLogLevel('info')
@@ -182,13 +188,25 @@ def main():
 
     # depois de criar s1
     root = net.addHost('root', inNamespace=False)
-    net.addLink(root, s1)
-    root.setIP('10.0.0.254/24', intf='root-eth0')
+    net.addLink(root, s1) # root-eth0 <-> s1-eth1 (host, 10.0.0.254)
+    root.setIP('10.0.0.254/24', intf='root-eth0') 
 
     info('*** Criando links (TCLink)\n')
     # Links com atraso inicial; banda nominal controlada por OVS/queues em egress
     net.addLink(gcs, s1, bw=args.bw, delay=args.delay)  # gcs-eth0 <-> s1-eth2
     net.addLink(uav, s1, bw=args.bw, delay=args.delay)  # uav-eth0 <-> s1-eth3
+
+    info('*** Criando links para Video (TCLink)\n')
+    net.addLink(root, s1) # root-eth1 <-> s1-eth4
+    net.addLink(uav, s1)  # uav-eth1  <-> s1-eth5
+
+    # sub-rede do VÍDEO
+    root.setIP('10.1.0.254/24', intf='root-eth1')  # host (QGC no host)
+    uav.setIP('10.1.0.2/24',    intf='uav-eth1')   # UAV (fonte do vídeo)
+
+    # Descobre IPs efetivos (evita erro se mudar sub-rede no futuro)
+    uav_video_ip  = uav.IP(intf='uav-eth1')      # ex.: 10.1.0.2
+    host_video_ip = root.IP(intf='root-eth1')    # ex.: 10.1.0.254
 
     info('*** Iniciando rede\n')
     net.start()
@@ -208,7 +226,7 @@ def main():
         q1_min=500_000,     # ISR mínimo
         q1_max=int(args.bw * 1_000_000) - 2_000_000
     )
-    apply_qos_ovs('s1', ['s1-eth2', 's1-eth3'], rates)
+    apply_qos_ovs('s1', ['s1-eth2', 's1-eth3', 's1-eth4', 's1-eth5' ], rates)
 
     # --- Marcação DSCP para C2 (no UAV e no GCS) ---
     info('*** Marcando DSCP EF (46) para tráfego C2 (UDP/14550)\n')
@@ -221,10 +239,25 @@ def main():
 
     # --- Mapeamento de interfaces para eventos ---
     iface_map = {
-        'ucv_to_gcs': 's1-eth2',
-        'ucv_to_uav': 's1-eth3',
-        # você pode adicionar alvos extras aqui
+        'ucv_to_gcs': 's1-eth2',   # C2: uplink/downlink GCS <-> OVS
+        'ucv_to_uav': 's1-eth3',   # C2: OVS <-> UAV
+        'video_to_host': 's1-eth4',# VÍDEO: OVS -> host (root-eth1)
+        'video_to_uav': 's1-eth5', # VÍDEO: OVS -> UAV (uav-eth1)
     }
+
+    procs = []  # processos que vamos limpar no final
+
+    if args.video_relay:
+        socat_cmd = (
+            f"socat -d -d -u "
+            f"UDP4-RECV:{args.video_listen_port},reuseaddr,ipv6only=0 "
+            f"UDP4-SENDTO:{args.video_dest_ip}:{args.video_dest_port}"
+        )
+        info(f'*** Iniciando relé de vídeo no UAV: {socat_cmd}\n')
+        p = uav.popen(socat_cmd, shell=True)
+        procs.append(('uav_socat5600', p))
+
+
 
     # --- Scheduler de eventos (thread) ---
     if args.events and Path(args.events).exists():
@@ -249,6 +282,16 @@ def main():
             pass
 
     info('*** Encerrando rede\n')
+    for name, p in procs:
+        try:
+            if p and p.poll() is None:
+                info(f'*** Encerrando processo {name}\n')
+                p.terminate()
+                # fallback forte, se necessário:
+                uav.cmd('pkill -f "socat .*UDP4-RECV:{port}"'.format(port=args.video_listen_port))
+        except Exception:
+            pass
+
     net.stop()
 
 if __name__ == '__main__':
