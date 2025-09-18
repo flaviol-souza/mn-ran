@@ -115,6 +115,7 @@ class UcvController(app_manager.RyuApp):
         self.interfaces = self.policy.get("interfaces", ["s1-eth2", "s1-eth3"])
         self.intf_to_portno = {}
         self._flows_installed = False
+        self._policy_stop = False
 
         # Perfiles de QoS (HTB) por estado
         self.qos_profiles = self.policy.get("qos_profiles", {
@@ -132,31 +133,34 @@ class UcvController(app_manager.RyuApp):
         ent = kpi_blk.get("enter", {})
         exi = kpi_blk.get("exit", {})
 
-        self.kpi_if          = self.policy.get("iface_c2", "root-eth0")
-        self.kpi_window_ms   = int(self.policy.get("windows_ms", 5000))
-        self.c2_rate_hz      = float(self.policy.get("c2_expected_rate_hz", 50.0))
+        self.kpi_if        = self.policy.get("iface_c2", self.interfaces[0] if self.interfaces else "s1-eth1")
+        self.kpi_window_ms = int(self.policy.get("windows_ms", 5000))
 
-        self.kpi_degrade_jit = float(ent.get("jitter_p95_ms", 30.0))
-        self.kpi_degrade_loss= float(ent.get("loss_p95_pct", 1.0))
-        self.kpi_hold_s      = float(ent.get("min_degraded_time_s", 2.0))
+        # taxa esperada de MAVLink (Hz)
+        self.c2_rate_hz    = float(self.policy.get("c2_expected_rate_hz", 50.0))
 
-        self.kpi_recover_jit = float(exi.get("jitter_p95_ms", 20.0))
-        self.kpi_recover_loss= float(exi.get("loss_p95_pct", 0.5))
-        self.kpi_cooldown_s  = float(exi.get("cooldown_s", 10.0))
+        # NOVO: IPs para filtro unidirecional UAV->HOST
+        self.c2_src_ip     = self.policy.get("c2_src_ip", None)  # UAV
+        self.c2_dst_ip     = self.policy.get("c2_dst_ip", None)  # HOST/QGC
 
-        self.logger.info("Policy loaded: %s", json.dumps(self.policy, indent=2))
+        self.kpi_degrade_jit  = float(ent.get("jitter_p95_ms", 30.0))
+        self.kpi_degrade_loss = float(ent.get("loss_p95_pct", 1.0))
+        self.kpi_degrade_bps  = float(ent.get("bitrate_floor_mbps", 0.0))  # Mbps (0 = ignorar)
+        self.kpi_hold_s       = float(ent.get("min_degraded_time_s", 0.0))
 
-        # Estado do policy loop
-        self._policy_stop = False
-        self._last_state = None
-        self._last_change_ts = 0.0
+        self.kpi_recover_jit  = float(exi.get("jitter_p95_ms", 20.0))
+        self.kpi_recover_loss = float(exi.get("loss_p95_pct", 0.5))
+        self.kpi_recover_bps  = float(exi.get("bitrate_floor_mbps", 0.0))  # Mbps (0 = ignorar)
+        self.kpi_cooldown_s   = float(exi.get("cooldown_s", 10.0))
 
-        # KPI buffers (tempo real)
-        self._kpi_timestamps = deque()     # segundos (float)
+        # buffers / métricas atuais
+        self._kpi_timestamps = deque()
         self._kpi_lock = hub.Semaphore(1)
         self._kpi_jitter_p95_ms = 0.0
         self._kpi_loss_pct = 0.0
+        self._kpi_bitrate_mbps = 0.0  # NOVO
         self._kpi_count = 0
+
 
         # Threads
         self._kpi_thr = None
@@ -279,72 +283,120 @@ class UcvController(app_manager.RyuApp):
 
     def _kpi_collector(self):
         """
-        Coleta timestamps de pacotes UDP/14550 na iface_c2 via tshark (não precisa dissector MAVLink),
-        calcula jitter p95 (inter-arrival) e perda estimada vs taxa esperada (c2_rate_hz).
+        Coleta timestamps e tamanhos de pacotes MAVLink (UDP/14550) **unidirecionais**
+        usando tshark no lado do HOST (iface_c2). Calcula:
+        - jitter_p95_ms: p95 dos inter-arrivals (ms)
+        - loss_p95_pct:  perda estimada vs taxa esperada (self.c2_rate_hz)
+        - bitrate_mbps:  throughput na janela
         """
+        import shutil
         iface = self.kpi_if
         window_ms = max(500, self.kpi_window_ms)
         window_s = window_ms / 1000.0
 
-        # tenta rodar tshark sem sudo (dumpcap costuma ter setcap)
+        # Filtro BPF **direcional** (UAV -> HOST)
+        bpf = "udp port 14550"
+        if self.c2_src_ip:
+            bpf = f"udp dst port 14550 and src host {self.c2_src_ip}"
+            if self.c2_dst_ip:
+                bpf += f" and dst host {self.c2_dst_ip}"
+
+        # tshark disponível?
+        if shutil.which("tshark") is None:
+            self.logger.error("[kpi] tshark não encontrado; alterando detection_mode='netem'")
+            self.detection_mode = "netem"
+            return
+
         cmd = (
-            f"tshark -l -i {shlex.quote(iface)} -f 'udp port 14550' "
-            f"-T fields -e frame.time_epoch"
+            f"tshark -l -i {shlex.quote(iface)} -f \"{bpf}\" "
+            f"-T fields -e frame.time_epoch -e frame.len"
         )
-        self.logger.info("[kpi] starting tshark on iface=%s", iface)
+        self.logger.info("[kpi] starting tshark on iface=%s bpf='%s'", iface, bpf)
+
         try:
             proc = subprocess.Popen(
                 cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
         except Exception as e:
-            self.logger.exception("[kpi] could not start tshark: %s", e)
+            self.logger.exception("[kpi] could not start tshark: %s; fallback to detection_mode='netem'", e)
+            self.detection_mode = "netem"
             return
 
+        # Buffers da janela deslizante
+        times = deque()
+        sizes = deque()
         last_stats_ts = 0.0
+
         try:
-            for line in proc.stdout:
-                line = line.strip()
+            while True:
+                line = proc.stdout.readline()
                 if not line:
+                    err = proc.stderr.read() if proc.stderr else ""
+                    if err:
+                        self.logger.error("[kpi] tshark encerrado: %s", err.strip())
+                    break
+
+                parts = line.strip().split()
+                if not parts:
                     continue
+
+                # timestamp
                 try:
-                    ts = float(line)
-                except:
+                    ts = float(parts[0])
+                except ValueError:
                     continue
 
-                # janela deslizante
-                with self._kpi_lock:
-                    self._kpi_timestamps.append(ts)
-                    cutoff = ts - window_s
-                    while self._kpi_timestamps and self._kpi_timestamps[0] < cutoff:
-                        self._kpi_timestamps.popleft()
+                # tamanho do frame (bytes)
+                size = 0
+                if len(parts) >= 2:
+                    try:
+                        size = int(parts[1])
+                    except ValueError:
+                        size = 0
 
-                    n = len(self._kpi_timestamps)
-                    self._kpi_count = n
+                # adiciona amostra
+                times.append(ts)
+                sizes.append(size)
 
-                    # inter-arrival (ms)
-                    if n >= 2:
-                        diffs = []
-                        prev = None
-                        for t in self._kpi_timestamps:
-                            if prev is not None:
-                                diffs.append((t - prev) * 1000.0)
-                            prev = t
-                        self._kpi_jitter_p95_ms = pctl(diffs, 0.95)
-                    else:
-                        self._kpi_jitter_p95_ms = 0.0
+                # mantém apenas a janela
+                cutoff = ts - window_s
+                while times and times[0] < cutoff:
+                    times.popleft()
+                    sizes.popleft()
 
-                    # perda estimada vs taxa esperada
-                    expected = max(1.0, self.c2_rate_hz * window_s)
-                    self._kpi_loss_pct = max(0.0, _pct(expected - n, expected))
-
-                # log leve a cada ~5s
-                now = time.time()
-                if now - last_stats_ts > 5.0:
+                # atualiza ~10 Hz
+                now = ts
+                if (now - last_stats_ts) >= 0.1:
                     last_stats_ts = now
-                    self.logger.debug(
-                        "[kpi] win=%.1fs n=%d jitter_p95=%.1fms loss=%.2f%%",
-                        window_s, self._kpi_count, self._kpi_jitter_p95_ms, self._kpi_loss_pct
-                    )
+                    n = len(times)
+
+                    # jitter p95 (ms) sobre inter-arrivals
+                    if n >= 3:
+                        diffs = [ (times[i] - times[i-1]) * 1000.0 for i in range(1, n) ]
+                        diffs.sort()
+                        k = (len(diffs) - 1) * 0.95
+                        f = math.floor(k); c = math.ceil(k)
+                        if f == c:
+                            jitter_p95 = diffs[int(k)]
+                        else:
+                            jitter_p95 = diffs[f] + (diffs[c] - diffs[f]) * (k - f)
+                    else:
+                        jitter_p95 = 0.0
+
+                    # perda estimada (%) vs taxa esperada
+                    expected = max(1.0, self.c2_rate_hz * window_s)
+                    loss_pct = max(0.0, min(100.0, (1.0 - (n / expected)) * 100.0))
+
+                    # bitrate (Mbps) na janela
+                    total_bytes = sum(sizes)
+                    bitrate_mbps = (total_bytes * 8.0) / (window_s * 1e6)
+
+                    with self._kpi_lock:
+                        self._kpi_count = n
+                        self._kpi_jitter_p95_ms = float(jitter_p95)
+                        self._kpi_loss_pct = float(loss_pct)
+                        self._kpi_bitrate_mbps = float(bitrate_mbps)
+
         except Exception as e:
             self.logger.exception("[kpi] collector error: %s", e)
         finally:
@@ -353,10 +405,12 @@ class UcvController(app_manager.RyuApp):
             except Exception:
                 pass
 
+
     def _read_kpi_snapshot(self):
         """Copia métricas atuais sob lock."""
         with self._kpi_lock:
-            return (self._kpi_count, self._kpi_jitter_p95_ms, self._kpi_loss_pct)
+            return (self._kpi_count, self._kpi_jitter_p95_ms, self._kpi_loss_pct, self._kpi_bitrate_mbps)
+
 
     # ---------- Policy loop ----------
 
@@ -394,34 +448,37 @@ class UcvController(app_manager.RyuApp):
                         state = "degraded"
 
                 elif self.detection_mode == "kpi":
-                    n, jit, loss = self._read_kpi_snapshot()
+                    n, jit, loss, br = self._read_kpi_snapshot()
                     now = time.time()
-                    # Histerese: degrade se (jit > enter.jit) OU (loss > enter.loss) por hold;
-                    # recupera se (jit < exit.jit) E (loss < exit.loss) por cooldown.
+
+                    def _degrade_condition():
+                        cond_jl = (jit > self.kpi_degrade_jit) or (loss > self.kpi_degrade_loss)
+                        cond_br = (self.kpi_degrade_bps > 0.0) and (br < self.kpi_degrade_bps)
+                        return cond_jl or cond_br
+
+                    def _recover_condition():
+                        cond_jl = (jit < self.kpi_recover_jit) and (loss < self.kpi_recover_loss)
+                        cond_br = (self.kpi_recover_bps <= 0.0) or (br >= self.kpi_recover_bps)
+                        return cond_jl and cond_br
+
+                    # Histerese
                     if self._last_state in (None, "baseline"):
-                        if (jit > self.kpi_degrade_jit) or (loss > self.kpi_degrade_loss):
-                            # Iniciar/checar temporização de hold
-                            if self._last_state != "degraded":
-                                if self._last_change_ts == 0.0:
-                                    self._last_change_ts = now
-                                elif (now - self._last_change_ts) >= self.kpi_hold_s:
-                                    state = "degraded"
-                                    self._last_change_ts = now
-                            else:
+                        if _degrade_condition():
+                            if self._last_change_ts == 0.0:
+                                self._last_change_ts = now
+                            elif (now - self._last_change_ts) >= self.kpi_hold_s:
                                 state = "degraded"
+                                self._last_change_ts = now
                         else:
                             self._last_change_ts = 0.0
-                    else:  # estado atual degraded
-                        if (jit < self.kpi_recover_jit) and (loss < self.kpi_recover_loss):
+                    else:  # degraded
+                        if _recover_condition():
                             if (now - self._last_change_ts) >= self.kpi_cooldown_s:
                                 state = "baseline"
                                 self._last_change_ts = now
-                            else:
-                                state = "degraded"
                         else:
                             # ainda degradado; reinicia cooldown
                             self._last_change_ts = now
-                            state = "degraded"
 
                 # Aplica apenas em mudança de estado
                 if state != self._last_state:
