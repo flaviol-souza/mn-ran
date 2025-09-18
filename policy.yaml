@@ -1,26 +1,33 @@
-# Interfaces do OVS a vigiar (saída do switch s1)
-interfaces:
-  - s1-eth2   # lado GCS
-  - s1-eth3   # lado UAV
-
-# Período de varredura (segundos)
+detection_mode: kpi
+interfaces: [s1-eth2, s1-eth3, s1-eth4, s1-eth5]
 poll_seconds: 2
 
-# Perfis de filas por porta (Queue 0=C2, Queue 1=ISR)
+iface_c2: s1-eth2 # porta OVS de referência para C2 (proxy de métricas on-line)
+windows_ms: 5000 # janela para p95/bitrate (5 s)
+
+# metas/limiares + histerese (sem renomear chaves)
+kpi:
+  enter:                  # entrar em 'degraded' se QUALQUER um cruzar + min_degraded_time_s
+    jitter_p95_ms: 30
+    loss_p95_pct: 1.0
+    bitrate_floor_mbps: 1.0
+    min_degraded_time_s: 2
+
+  exit:                   # voltar a 'baseline' se TODOS ficarem melhores + cooldown_s
+    jitter_p95_ms: 20
+    loss_p95_pct: 0.5
+    bitrate_floor_mbps: 2.0
+    cooldown_s: 10
+
+# perfis de filas (HTB): q0 = EF/C2, q1 = AF/Vídeo
 qos_profiles:
   baseline:
-    q0_min: 2000000     # 2 Mbps
-    q0_max: 5000000     # 5 Mbps
-    q1_min: 500000      # 0.5 Mbps
-    q1_max: 98000000    # ~98 Mbps (restante)
+    q0_min: 2000000    # 2 Mb/s min para C2
+    q0_max: 5000000    # 5 Mb/s max
+    q1_min: 500000     # 0.5 Mb/s min para vídeo
+    q1_max: 98000000   # ~98 Mb/s max (sem apertar)
   degraded:
-    q0_min: 4000000     # 4 Mbps (reforça C2)
-    q0_max: 8000000     # 8 Mbps
-    q1_min: 200000      # 0.2 Mbps
-    q1_max: 5000000     # 5 Mbps (aperta ISR)
-
-# Modo de detecção:
-# - "netem": considera degradado se tc qdisc netem existir na interface
-# - "kpi": 
-# - "kpi_or_netem"
-detection_mode: kpi
+    q0_min: 4000000    # prioriza C2 quando degradado
+    q0_max: 8000000
+    q1_min: 200000     # aperta vídeo (não deixa varrer o link)
+    q1_max: 5000000
