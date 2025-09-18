@@ -101,9 +101,12 @@ class UcvController(app_manager.RyuApp):
         self.policy_path = os.environ.get("UCV_POLICY", "policy.yaml")
         self.policy = load_policy(self.policy_path)
         self.detection_mode = self.policy.get("detection_mode", "netem")
+        self.kpi_cfg = self.policy.get("kpi", {})
         self.interfaces = self.policy.get("interfaces", ['s1-eth2', 's1-eth3', 's1-eth4', 's1-eth5'])
         self.qos_profiles = self.policy.get("qos_profiles", {})
         self.poll_seconds = int(self.policy.get("poll_seconds", 2))
+
+        self._last_state = None
         self._policy_stop = False
         self.logger.info(f"Policy loaded: {self.policy}")
 
@@ -130,6 +133,43 @@ class UcvController(app_manager.RyuApp):
             hub.spawn(self._kpi_loop)
         else:
             self.logger.info("[kpi] detection_mode=%s -> KPI monitor disabled", self.detection_mode)
+
+    def _state_from_kpi_file(self, last_state):
+        path = self.kpi_cfg.get("source_file", "/tmp/kpi_state.tsv")
+        enter = self.kpi_cfg.get("enter", {})
+        exitc = self.kpi_cfg.get("exit", {})
+
+        try:
+            with open(path, "r") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+            if not lines:
+                return last_state or "baseline"
+            # lê última linha útil (ignora cabeçalho)
+            row = lines[-1]
+            if row.startswith("ts_epoch"):
+                if len(lines) == 1:
+                    return last_state or "baseline"
+                row = lines[-2]
+            parts = row.split("\t")
+            # ts, loss, jitter, kbps
+            ts = float(parts[0]); loss = float(parts[1]); jitter = float(parts[2]); kbps = float(parts[3])
+
+            if last_state == "degraded":
+                ok = True
+                if "c2_loss_pct" in exitc:      ok &= (loss <= float(exutc := exitc["c2_loss_pct"]))
+                if "c2_jitter_ms" in exitc:     ok &= (jitter <= float(exitc["c2_jitter_ms"]))
+                if "video_kbps_min" in exitc:   ok &= (kbps  >= float(exitc["video_kbps_min"]))
+                return "baseline" if ok else "degraded"
+            else:
+                bad = False
+                if "c2_loss_pct" in enter:      bad |= (loss >= float(enter["c2_loss_pct"]))
+                if "c2_jitter_ms" in enter:     bad |= (jitter >= float(enter["c2_jitter_ms"]))
+                if "video_kbps_min" in enter:   bad |= (kbps  <  float(enter["video_kbps_min"]))
+                return "degraded" if bad else "baseline"
+
+        except Exception as e:
+            self.logger.warning(f"[kpi] parse fail: {e}")
+            return last_state or "baseline"
 
     def _kpi_loop(self):
         """
@@ -247,6 +287,9 @@ class UcvController(app_manager.RyuApp):
                         self.logger.debug("[kpi] n=%d loss=%.2f%% jitter_p95=%.1fms -> %s",
                                         n, loss, jit, state)
                         last_kpi_log = now
+                
+                elif mode == "kpi_file":
+                    state = self._state_from_kpi_file(last_state)
 
                 elif mode in ("kpi_or_netem", "both"):
                     # degrada se KPI OU NETEM indicar degradação
@@ -332,9 +375,6 @@ class UcvController(app_manager.RyuApp):
         match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_src=5600)
         actions = [parser.OFPActionSetQueue(1), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
         self.add_flow(dp, 55, match, actions, idle=0, hard=0)
-
-
-
 
     def add_flow(self, datapath, priority, match, actions, idle=30, hard=60):
         ofp = datapath.ofproto
