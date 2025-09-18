@@ -108,7 +108,7 @@ def run_events(events_file: str, iface_map: dict, start_time: float):
     Lê events.yaml e aplica netem/cortes conforme timeline.
     Formato exemplo:
       - at: 15.0
-        target: ucv_to_uav     # mapeia para interface s1-eth3
+        target: ucv_to_uav     # mapeia para interface s1-eth2
         netem:
           delay_ms: 80
           jitter_ms: 20
@@ -180,7 +180,6 @@ def main():
     c0 = net.addController('c0', controller=RemoteController, ip=args.ctrl_ip, port=args.ctrl_port)
 
     info('*** Adicionando hosts\n')
-    gcs = net.addHost('gcs', ip='10.0.0.1/24')
     uav = net.addHost('uav', ip='10.0.0.2/24')
 
     info('*** Adicionando switch (UCV/OVS)\n')
@@ -193,12 +192,11 @@ def main():
 
     info('*** Criando links (TCLink)\n')
     # Links com atraso inicial; banda nominal controlada por OVS/queues em egress
-    net.addLink(gcs, s1, bw=args.bw, delay=args.delay)  # gcs-eth0 <-> s1-eth2
-    net.addLink(uav, s1, bw=args.bw, delay=args.delay)  # uav-eth0 <-> s1-eth3
+    net.addLink(uav, s1, bw=args.bw, delay=args.delay)  # uav-eth0 <-> s1-eth2
 
     info('*** Criando links para Video (TCLink)\n')
-    net.addLink(root, s1) # root-eth1 <-> s1-eth4
-    net.addLink(uav, s1)  # uav-eth1  <-> s1-eth5
+    net.addLink(root, s1) # root-eth1 <-> s1-eth3
+    net.addLink(uav, s1)  # uav-eth1  <-> s1-eth4
 
     # sub-rede do VÍDEO
     root.setIP('10.1.0.254/24', intf='root-eth1')  # host (QGC no host)
@@ -226,23 +224,21 @@ def main():
         q1_min=500_000,     # ISR mínimo
         q1_max=int(args.bw * 1_000_000) - 2_000_000
     )
-    apply_qos_ovs('s1', ['s1-eth2', 's1-eth3', 's1-eth4', 's1-eth5' ], rates)
+    apply_qos_ovs('s1', ['s1-eth1', 's1-eth2', 's1-eth3', 's1-eth4' ], rates)
 
     # --- Marcação DSCP para C2 (no UAV e no GCS) ---
     info('*** Marcando DSCP EF (46) para tráfego C2 (UDP/14550)\n')
     mark_dscp_for_c2(uav, sport=14550, dscp_class='EF')
-    mark_dscp_for_c2(gcs, sport=14550, dscp_class='EF')
-
+    
     # --- Rotas básicas (ARP/ICMP ok) ---
-    gcs.cmd('ip route add default dev gcs-eth0 || true')
     uav.cmd('ip route add default dev uav-eth0 || true')
 
     # --- Mapeamento de interfaces para eventos ---
     iface_map = {
-        'ucv_to_gcs': 's1-eth2',   # C2: uplink/downlink GCS <-> OVS
-        'ucv_to_uav': 's1-eth3',   # C2: OVS <-> UAV
-        'video_to_host': 's1-eth4',# VÍDEO: OVS -> host (root-eth1)
-        'video_to_uav': 's1-eth5', # VÍDEO: OVS -> UAV (uav-eth1)
+        'ucv_to_gcs': 's1-eth1',   # C2: uplink/downlink HOST <-> OVS
+        'ucv_to_uav': 's1-eth2',   # C2: OVS <-> UAV
+        'video_to_host': 's1-eth3',# VÍDEO: OVS -> host (root-eth1)
+        'video_to_uav': 's1-eth4', # VÍDEO: OVS -> UAV (uav-eth1)
     }
 
     procs = []  # processos que vamos limpar no final
@@ -269,7 +265,7 @@ def main():
         info('*** Sem arquivo de eventos; execução contínua.\n')
 
     info('*** Pronto. Use ping entre hosts ou rode seus apps (PX4/QGC) nos hosts Mininet.\n')
-    info('    Ex.: mininet> gcs ping -c 3 10.0.0.2\n')
+    info('    Ex.: mininet> root ping -c 3 10.0.0.2\n')
 
     if args.start_cli:
         CLI(net)

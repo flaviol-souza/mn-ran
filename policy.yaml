@@ -1,8 +1,8 @@
 detection_mode: kpi
-interfaces: [s1-eth2, s1-eth3, s1-eth4, s1-eth5]
+interfaces: ["s1-eth1", "s1-eth2", "s1-eth3", "s1-eth4"]
 poll_seconds: 2
 
-iface_c2: s1-eth2 # porta OVS de referência para C2 (proxy de métricas on-line)
+iface_c2: s1-eth1 # porta OVS de referência para C2 (proxy de métricas on-line)
 windows_ms: 5000 # janela para p95/bitrate (5 s)
 
 # metas/limiares + histerese (sem renomear chaves)

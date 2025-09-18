@@ -113,6 +113,8 @@ class UcvController(app_manager.RyuApp):
 
         # Interfaces onde aplicar QoS/filas (devem ter QoS criado pelo ucv.py)
         self.interfaces = self.policy.get("interfaces", ["s1-eth2", "s1-eth3"])
+        self.intf_to_portno = {}
+        self._flows_installed = False
 
         # Perfiles de QoS (HTB) por estado
         self.qos_profiles = self.policy.get("qos_profiles", {
@@ -167,7 +169,12 @@ class UcvController(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """Instala fluxos proativos (C2/14550 → fila 0, Vídeo/5600 → fila 1)."""
+        """Instala fluxos proativos com SAÍDA EXPLÍCITA por porta.
+        - Mantém ARP/ICMP em NORMAL
+        - UDP/14550 (C2) -> fila 0 com Output(port_no)
+        - UDP/5600 (Vídeo) -> fila 1 com Output(port_no)
+        Portas são resolvidas via PortDesc (sem ovs-vsctl).
+        """
         dp = ev.msg.datapath
         ofp = dp.ofproto
         parser = dp.ofproto_parser
@@ -187,23 +194,74 @@ class UcvController(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(ofp.OFPP_NORMAL)]
         self.add_flow(dp, 40, match, actions, idle=0, hard=0)
 
-        # UDP/14550 (C2) → fila 0 (ambos sentidos), prio 60
-        match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_dst=14550)
-        actions = [parser.OFPActionSetQueue(0), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
-        self.add_flow(dp, 60, match, actions, idle=0, hard=0)
+        # Solicita descrição de portas para mapear nome->port_no
+        req = parser.OFPPortDescStatsRequest(dp, 0)
+        dp.send_msg(req)
+        self.logger.info("[flows] requisitado PortDesc para mapear ofports...")
 
-        match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_src=14550)
-        actions = [parser.OFPActionSetQueue(0), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
-        self.add_flow(dp, 60, match, actions, idle=0, hard=0)
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def port_desc_reply_handler(self, ev):
+        """Recebe PortDesc e instala fluxos com saída explícita por porta."""
+        dp = ev.msg.datapath
+        mp = {}
+        for p in ev.msg.body:
+            name = p.name if isinstance(p.name, str) else getattr(p, 'name', b'')
+            if not isinstance(name, str):
+                try:
+                    name = name.decode('utf-8', 'ignore')
+                except Exception:
+                    name = str(name)
+            mp[name] = p.port_no
+        self.intf_to_portno = mp
+        pretty = {k: v for k, v in sorted(mp.items()) if k.startswith('s1-eth')}
+        self.logger.info("[flows] PortDesc recebido (nome->port_no): %s", pretty)
+        self._install_queued_flows(dp)
 
-        # UDP/5600 (Vídeo) → fila 1 (ambos sentidos), prio 55
-        match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_dst=5600)
-        actions = [parser.OFPActionSetQueue(1), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
-        self.add_flow(dp, 55, match, actions, idle=0, hard=0)
+    def _install_queued_flows(self, dp):
+        """Instala fluxos com set_queue + Output(port_no) para C2 e Vídeo."""
+        if self._flows_installed:
+            return
+        parser = dp.ofproto_parser
 
-        match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_src=5600)
-        actions = [parser.OFPActionSetQueue(1), parser.OFPActionOutput(ofp.OFPP_NORMAL)]
-        self.add_flow(dp, 55, match, actions, idle=0, hard=0)
+        def portno(name): return self.intf_to_portno.get(name)
+
+        ints = self.interfaces
+        pairs = []
+        if len(ints) >= 2:
+            pairs.append(('c2', ints[0], ints[1], 14550, 0))  # fila 0
+        if len(ints) >= 4:
+            pairs.append(('vid', ints[2], ints[3], 5600, 1))  # fila 1
+
+        for typ, a, b, udp_port, qid in pairs:
+            pA, pB = portno(a), portno(b)
+            if pA is None or pB is None:
+                self.logger.warning("[flows] par %s incompleto (%s=%s, %s=%s)", typ, a, pA, b, pB)
+                continue
+            prio = 60 if typ == 'c2' else 55
+
+            # A->B
+            match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_dst=udp_port, in_port=pA)
+            actions = [parser.OFPActionSetQueue(qid), parser.OFPActionOutput(pB)]
+            self.add_flow(dp, prio, match, actions, idle=0, hard=0)
+
+            match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_src=udp_port, in_port=pA)
+            actions = [parser.OFPActionSetQueue(qid), parser.OFPActionOutput(pB)]
+            self.add_flow(dp, prio, match, actions, idle=0, hard=0)
+
+            # B->A
+            match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_dst=udp_port, in_port=pB)
+            actions = [parser.OFPActionSetQueue(qid), parser.OFPActionOutput(pA)]
+            self.add_flow(dp, prio, match, actions, idle=0, hard=0)
+
+            match = parser.OFPMatch(eth_type=0x0800, ip_proto=17, udp_src=udp_port, in_port=pB)
+            actions = [parser.OFPActionSetQueue(qid), parser.OFPActionOutput(pA)]
+            self.add_flow(dp, prio, match, actions, idle=0, hard=0)
+
+            self.logger.info("[flows] %s(%d) fila=%d entre %s<->%s (%d<->%d)",
+                            "C2" if typ == 'c2' else "Vídeo", udp_port, qid, a, b, pA, pB)
+
+        self._flows_installed = True
+
 
     def add_flow(self, datapath, priority, match, actions, idle=0, hard=0):
         ofp = datapath.ofproto
@@ -384,3 +442,37 @@ class UcvController(app_manager.RyuApp):
     def close(self):
         self._policy_stop = True
         hub.sleep(0.1)
+
+        # ---------- Helpers de portas ----------
+    def _get_ofport(self, ifname: str):
+        """Resolve o ofport de uma Interface OVS pelo nome (ex.: s1-eth2 -> 2)."""
+        rc, out, err = run_cmd(f"ovs-vsctl get Interface {shlex.quote(ifname)} ofport")
+        if rc != 0:
+            self.logger.error("[ports] falha ao obter ofport de %s: %s", ifname, err)
+            return None
+        try:
+            return int(out)
+        except Exception:
+            self.logger.error("[ports] valor inválido de ofport para %s: %s", ifname, out)
+            return None
+
+    def _resolve_pairs(self):
+        """
+        Mapeia os pares (C2, Vídeo) a partir de self.interfaces.
+        Espera: [c2_a, c2_b, vid_a, vid_b].
+        Retorna dict com números de porta (ou None se não houver).
+        """
+        iflen = len(self.interfaces)
+        c2_a = self.interfaces[0] if iflen >= 2 else None
+        c2_b = self.interfaces[1] if iflen >= 2 else None
+        vid_a = self.interfaces[2] if iflen >= 4 else None
+        vid_b = self.interfaces[3] if iflen >= 4 else None
+
+        pairs = {}
+        if c2_a and c2_b:
+            pairs["c2_a"] = (c2_a, self._get_ofport(c2_a))
+            pairs["c2_b"] = (c2_b, self._get_ofport(c2_b))
+        if vid_a and vid_b:
+            pairs["vid_a"] = (vid_a, self._get_ofport(vid_a))
+            pairs["vid_b"] = (vid_b, self._get_ofport(vid_b))
+        return pairs
