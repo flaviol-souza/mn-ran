@@ -1,48 +1,12 @@
-- at: 90
-  iface: s1-eth2
-  netem: {corrupt_pct: 0.05}
-- at: 90
-  iface: s1-eth3
-  netem: {corrupt_pct: 0.05}
-- at: 150
-  iface: s1-eth2
-  clear: true
-- at: 150
-  iface: s1-eth3
-  clear: true
-- at: 180
-  iface: s1-eth2
-  netem: {corrupt_pct: 0.05}
-- at: 180
-  iface: s1-eth3
-  netem: {corrupt_pct: 0.05}
-- at: 240
-  iface: s1-eth2
-  clear: true
-- at: 240
-  iface: s1-eth3
-  clear: true
-- at: 270
-  iface: s1-eth2
-  netem: {corrupt_pct: 0.05}
-- at: 270
-  iface: s1-eth3
-  netem: {corrupt_pct: 0.05}
-- at: 330
-  iface: s1-eth2
-  clear: true
-- at: 330
-  iface: s1-eth3
-  clear: true
-- at: 360
-  iface: s1-eth2
-  netem: {corrupt_pct: 0.05}
-- at: 360
-  iface: s1-eth3
-  netem: {corrupt_pct: 0.05}
-- at: 420
-  iface: s1-eth2
-  clear: true
-- at: 420
-  iface: s1-eth3
+#Objetivo. Separar efeitos de perda vs. corrupção (importante para vídeo/codec).
+#Fundamento. tc-netem permite corrupt PERCENT (injeta bit-errors aleatórios). Métrica de perda continua IPPM; “jitter” pela PDV/IPDV
+# - Perda pode não subir tanto, mas QoE de vídeo cai (macro-blocking, freezes).
+# - Como tua lógica de KPI hoje é baseada em C2 (PDV/loss) + piso de bitrate do vídeo, a queda de goodput pode sinalizar degraded.
+
+- at: 55.0
+  target: video_to_host
+  netem: { corrupt_pct: 0.05 }
+
+- at: 85.0
+  target: video_to_host
   clear: true
