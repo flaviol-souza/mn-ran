@@ -37,12 +37,20 @@ def apply_netem_on(host, intf: str, params: dict, action='add'):
         host.cmd(f"tc qdisc del dev {intf} root || true")
         return
 
-    delay  = params.get('delay_ms')
-    jitter = params.get('jitter_ms')
-    loss   = params.get('loss_pct')
-    rate   = params.get('rate_mbit')
-
-    cmd = netem_cmd(intf, delay, jitter, loss, rate, action=('change' if action=='change' else 'add'))
+    cmd = netem_cmd(
+        intf,
+        delay=params.get('delay_ms'),
+        jitter=params.get('jitter_ms'),
+        loss=params.get('loss_pct'),
+        loss_corr=params.get('corr_pct'),
+        corrupt=params.get('corrupt_pct'),
+        duplicate=params.get('dup_pct'),
+        reorder=params.get('reorder_pct'),
+        reorder_gap=params.get('reorder_gap_ms'),
+        rate=params.get('rate_mbit'),
+        seed=params.get('seed'),
+        action=('change' if action=='change' else 'add')
+    )
     host.cmd(cmd)
 
 def apply_qos_ovs(bridge: str, ifaces, rates):
@@ -87,21 +95,28 @@ def mark_dscp_for_c2(host, sport=14550, dscp_class='EF'):
     # (Opcional) marca entradas destinadas ao host (ex.: GCS recebendo MAVLink)
     host.cmd(f"iptables -t mangle -A PREROUTING -p udp --dport {sport} -j DSCP --set-dscp-class {dscp_class}")
 
-def netem_cmd(dev: str, delay=None, jitter=None, loss=None, rate=None, action='add'):
-    """
-    Monta comando tc netem (delay, jitter, loss, rate). action: add/change/del
-    """
+def netem_cmd(dev: str, delay=None, jitter=None, loss=None, rate=None,
+              loss_corr=None, corrupt=None, duplicate=None,
+              reorder=None, reorder_gap=None, seed=None, action='add'):
     parts = [f"tc qdisc {action} dev {dev} root netem"]
     if delay is not None:
-        if jitter is not None:
-            parts.append(f"delay {delay}ms {jitter}ms")
-        else:
-            parts.append(f"delay {delay}ms")
+        parts.append(f"delay {delay}ms" + (f" {jitter}ms" if jitter is not None else ""))
     if loss is not None:
-        parts.append(f"loss {loss}%")
+        # suporta "loss X% [corr%]"
+        parts.append(f"loss {loss}%" + (f" {loss_corr}%" if loss_corr is not None else ""))
+    if corrupt is not None:
+        parts.append(f"corrupt {corrupt}%")
+    if duplicate is not None:
+        parts.append(f"duplicate {duplicate}%")
+    if reorder is not None:
+        rg = f" gap {reorder_gap}ms" if reorder_gap is not None else ""
+        parts.append(f"reorder {reorder}%{rg}")
     if rate is not None:
         parts.append(f"rate {rate}mbit")
+    if seed is not None:
+        parts.append(f"seed {seed}")
     return " ".join(parts)
+
 
 def apply_netem(intf: str, params: dict, action='add'):
     """Aplica netem na interface fornecida."""
