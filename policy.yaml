@@ -1,4 +1,4 @@
-detection_mode: kpi
+detection_mode: netem
 interfaces: [s1-eth1, s1-eth2, s1-eth3, s1-eth4]  # [C2_host, C2_uav, VID_host, VID_uav]
 #  - s1-eth1   # C2: HOST(root-eth0) <-> OVS
 #  - s1-eth2   # C2: OVS <-> UAV (uav-eth0)
@@ -6,28 +6,48 @@ interfaces: [s1-eth1, s1-eth2, s1-eth3, s1-eth4]  # [C2_host, C2_uav, VID_host, 
 #  - s1-eth4   # VÍDEO: OVS -> UAV  (uav-eth1)
 qos_init_profile: baseline   # ou "degraded" para iniciar já apertado
 poll_seconds: 2
-
 iface_c2: "s1-eth1" # porta OVS de referência para C2 (proxy de métricas on-line)
-windows_ms: 5000 # janela para p95/bitrate (5 s)
-c2_expected_rate_hz: 50 # taxa de envio esperada de MAVLink na janela (Hz)
 
 #filtro unidirecional para amostrar apenas UAV -> HOST (uplink)
 c2_src_ip: "10.0.0.2"     # IP do UAV (origem dos pacotes)
 c2_dst_ip: "10.0.0.254"   # IP do HOST/QGC (destino dos pacotes)
 
-# metas/limiares + histerese (sem renomear chaves)
-kpi:
-  enter:                  # entrar em 'degraded' se QUALQUER um cruzar + min_degraded_time_s
-    jitter_p95_ms: 30
-    loss_p95_pct: 1.0
-    bitrate_floor_mbps: 1.0
-    min_degraded_time_s: 2
+# Taxa esperada de mensagens C2/MAVLink (Hz) – determina o período T (=1000/f) em ms.
+# Basilar: dimensionamento de controle de voo e C2 (ref. DO-362A / FAA TSO-C213a: metas de latência/continuidade dependem da aplicação/classe).
+c2_expected_rate_hz: 50
 
-  exit:                   # voltar a 'baseline' se TODOS ficarem melhores + cooldown_s
-    jitter_p95_ms: 20
+kpi:
+  #  - "interarrival": estima perda comparando amostras recebidas vs. esperadas na janela.
+  #  - "mavlink_seq": (opcional) usa o campo de sequência MAVLink do dissector para perda “real”.
+  # Basilar (métrica de perda): IETF RFC 2680 (one-way loss); se não houver timesync, usar estimativa por chegada.
+  method: interarrival
+
+  # Janela móvel de cálculo (ms). Basilar (métrica de variação de atraso): IETF RFC 3393 / RFC 5481 (PDV/IPDV em conjuntos de amostras).
+  window_ms: 5000
+
+  # Continuidade: considera “outage” quando o gap entre updates C2 ≥ K×T.
+  # Ex.: 25×T em 50 Hz ≈ 500 ms. Basilar: EUROCONTROL (continuidade/transação dentro do tempo).
+  continuity_gap_T_mult: 25.0
+
+  # continuidade na janela (relato, e pode virar critério):
+  continuity_min_uptime_pct: 99.5
+
+  # export em JSONL para gráficos/relato.
+  export_jsonl_path: /tmp/ucv_kpi.jsonl
+
+  # Perda p95 (%) para entrar/sair de degradado – mantenha histerese.
+  # Basilar: perda de pacote (RFC 2680) e continuidade de serviço (EUROCONTROL DLP metrics).
+  # Limiares de jitter **derivados do período T** PDV/IPDV (RFC 3393/5481) e relacionar a T do controle em vez de fixos.
+  enter:
+    jitter_T_mult: 3.0        # Limiares de jitter = 3×T → comportamento conservador: com T=20 ms (50 Hz), p95≈60 ms
+    loss_p95_pct: 1.0
+    bitrate_floor_mbps: 1.0   # piso de goodput do VÍDEO; QoE de missão (não é norma IPPM)
+    min_degraded_time_s: 2.0  # hold para evitar “flap”
+  exit:
+    jitter_T_mult: 2.0        # Limiares de jitter = 2×T → recupera quando PDV p95 cai abaixo de 40 ms
     loss_p95_pct: 0.5
     bitrate_floor_mbps: 2.0
-    cooldown_s: 10
+    cooldown_s: 10.0          # tempo mínimo “bom” antes de voltar ao baseline
 
 # perfis de filas (HTB): q0 = EF/C2, q1 = AF/Vídeo
 qos_profiles:

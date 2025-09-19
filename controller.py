@@ -116,6 +116,8 @@ class UcvController(app_manager.RyuApp):
         self.intf_to_portno = {}
         self._flows_installed = False
         self._policy_stop = False
+        self._last_state = None        # último perfil aplicado: "baseline" ou "degraded"
+        self._last_change_ts = 0.0     # timestamp da última troca (para hold/cooldown)
 
         # Perfiles de QoS (HTB) por estado
         self.qos_profiles = self.policy.get("qos_profiles", {
@@ -134,15 +136,11 @@ class UcvController(app_manager.RyuApp):
         exi = kpi_blk.get("exit", {})
 
         self.kpi_if        = self.policy.get("iface_c2", self.interfaces[0] if self.interfaces else "s1-eth1")
-        self.kpi_window_ms = int(self.policy.get("windows_ms", 5000))
+        self.kpi_window_ms = int(self.policy.get("window_ms", 5000))
 
         # taxa esperada de MAVLink (Hz)
         self.c2_rate_hz    = float(self.policy.get("c2_expected_rate_hz", 50.0))
-
-        # NOVO: IPs para filtro unidirecional UAV->HOST
-        self.c2_src_ip     = self.policy.get("c2_src_ip", None)  # UAV
-        self.c2_dst_ip     = self.policy.get("c2_dst_ip", None)  # HOST/QGC
-
+        self._kpi_continuity_up_pct = 100.0
         self.kpi_degrade_jit  = float(ent.get("jitter_p95_ms", 30.0))
         self.kpi_degrade_loss = float(ent.get("loss_p95_pct", 1.0))
         self.kpi_degrade_bps  = float(ent.get("bitrate_floor_mbps", 0.0))  # Mbps (0 = ignorar)
@@ -153,14 +151,45 @@ class UcvController(app_manager.RyuApp):
         self.kpi_recover_bps  = float(exi.get("bitrate_floor_mbps", 0.0))  # Mbps (0 = ignorar)
         self.kpi_cooldown_s   = float(exi.get("cooldown_s", 10.0))
 
+        # período do C2 em ms
+        T_ms = 1000.0 / max(1e-6, self.c2_rate_hz)
+
+        # ler multiplicadores (se existirem)
+        enter_mult = float(ent.get("jitter_T_mult", 0.0))
+        exit_mult  = float(exi.get("jitter_T_mult", 0.0))
+
+        # se definidos, sobrescrevem os thresholds absolutos
+        if enter_mult > 0:
+            self.kpi_degrade_jit = T_ms * enter_mult
+        if exit_mult > 0:
+            self.kpi_recover_jit = T_ms * exit_mult
+
+        # continuidade (gap) derivada de K×T, com fallback em ms absoluto se preferir
+        cont_mult = float(kpi_blk.get("continuity_gap_T_mult", 0.0))
+        self.kpi_gap_ms = (T_ms * cont_mult) if cont_mult > 0 else float(kpi_blk.get("continuity_gap_ms", 500.0))
+
+        # alvo de continuidade para decisão/relato
+        self.kpi_cont_uptime_target = float(kpi_blk.get("continuity_min_uptime_pct", 0.0))
+
+        # export JSONL
+        self.kpi_export = kpi_blk.get("export_jsonl_path", None)
+
+        # IPs para filtro unidirecional UAV->HOST
+        self.c2_src_ip     = self.policy.get("c2_src_ip", None)  # UAV
+        self.c2_dst_ip     = self.policy.get("c2_dst_ip", None)  # HOST/QGC       
+
         # buffers / métricas atuais
         self._kpi_timestamps = deque()
         self._kpi_lock = hub.Semaphore(1)
         self._kpi_jitter_p95_ms = 0.0
         self._kpi_loss_pct = 0.0
-        self._kpi_bitrate_mbps = 0.0  # NOVO
+        self._kpi_bitrate_mbps = 0.0
         self._kpi_count = 0
 
+        self.logger.info( 
+            "[kpi] T=%.1f ms | jitter_enter=%.1f ms | jitter_exit=%.1f ms | gap=%.1f ms | loss_enter=%.2f%% | loss_exit=%.2f%% | br_floor_enter=%.2f Mb/s | br_floor_exit=%.2f Mb/s",
+            T_ms, self.kpi_degrade_jit, self.kpi_recover_jit, self.kpi_gap_ms, self.kpi_degrade_loss, self.kpi_recover_loss, self.kpi_degrade_bps, self.kpi_recover_bps
+        )
 
         # Threads
         self._kpi_thr = None
@@ -374,6 +403,8 @@ class UcvController(app_manager.RyuApp):
                     if n >= 3:
                         diffs = [ (times[i] - times[i-1]) * 1000.0 for i in range(1, n) ]
                         diffs.sort()
+                        outage_time_s = sum(d/1000.0 for d in diffs if d >= self.kpi_gap_ms)
+                        continuity_uptime_pct = max(0.0, 100.0 * (window_s - outage_time_s) / window_s)
                         k = (len(diffs) - 1) * 0.95
                         f = math.floor(k); c = math.ceil(k)
                         if f == c:
@@ -382,6 +413,7 @@ class UcvController(app_manager.RyuApp):
                             jitter_p95 = diffs[f] + (diffs[c] - diffs[f]) * (k - f)
                     else:
                         jitter_p95 = 0.0
+                        continuity_uptime_pct = 100.0
 
                     # perda estimada (%) vs taxa esperada
                     expected = max(1.0, self.c2_rate_hz * window_s)
@@ -396,12 +428,28 @@ class UcvController(app_manager.RyuApp):
                         self._kpi_jitter_p95_ms = float(jitter_p95)
                         self._kpi_loss_pct = float(loss_pct)
                         self._kpi_bitrate_mbps = float(bitrate_mbps)
+                        self._kpi_continuity_up_pct = float(continuity_uptime_pct)
 
         except Exception as e:
             self.logger.exception("[kpi] collector error: %s", e)
         finally:
             try:
                 proc.terminate()
+            except Exception:
+                pass
+
+        if self.kpi_export:
+            try:
+                rec = {
+                    "ts": now,
+                    "n": n,
+                    "jitter_p95_ms": float(jitter_p95),
+                    "loss_pct": float(loss_pct),
+                    "bitrate_mbps": float(bitrate_mbps),
+                    "continuity_uptime_pct": float(continuity_uptime_pct)
+                }
+                with open(self.kpi_export, "a") as fp:
+                    fp.write(json.dumps(rec) + "\n")
             except Exception:
                 pass
 
@@ -421,31 +469,30 @@ class UcvController(app_manager.RyuApp):
           - 'kpi'    : thresholds de histerese em jitter p95 e perda (%)
         Só aplica quando encontrar filas 0/1 em TODAS as portas listadas.
         """
+        self._current_profile = None
         self._last_state = None
         self._last_change_ts = 0.0
 
         while not self._policy_stop:
             try:
-                # Verifica se filas existem em todas as portas
-                ready = True
-                qmap = {}
+                # checa filas em todas as portas
+                ready, qmap = True, {}
                 for itf in self.interfaces:
                     q0, q1 = ovs_port_queues(itf)
                     if not q0 or not q1:
                         ready = False
                         break
                     qmap[itf] = (q0, q1)
-
                 if not ready:
                     self.logger.debug("[policy] queues not found in all interfaces; waiting...")
                     hub.sleep(self.poll_seconds)
                     continue
 
-                # Detecta estado
-                state = "baseline"
+                # comece do estado anterior (não force baseline por default)
+                state = self._last_state or "baseline"
+
                 if self.detection_mode == "netem":
-                    if any(has_netem(itf) for itf in self.interfaces):
-                        state = "degraded"
+                    state = "degraded" if any(has_netem(itf) for itf in self.interfaces) else "baseline"
 
                 elif self.detection_mode == "kpi":
                     n, jit, loss, br = self._read_kpi_snapshot()
@@ -454,14 +501,15 @@ class UcvController(app_manager.RyuApp):
                     def _degrade_condition():
                         cond_jl = (jit > self.kpi_degrade_jit) or (loss > self.kpi_degrade_loss)
                         cond_br = (self.kpi_degrade_bps > 0.0) and (br < self.kpi_degrade_bps)
-                        return cond_jl or cond_br
+                        cond_ct = (getattr(self, "_kpi_continuity_up_pct", 100.0) < self.kpi_cont_uptime_target) if self.kpi_cont_uptime_target > 0 else False
+                        return cond_jl or cond_br or cond_ct
 
                     def _recover_condition():
                         cond_jl = (jit < self.kpi_recover_jit) and (loss < self.kpi_recover_loss)
                         cond_br = (self.kpi_recover_bps <= 0.0) or (br >= self.kpi_recover_bps)
-                        return cond_jl and cond_br
+                        cond_ct = (getattr(self, "_kpi_continuity_up_pct", 100.0) >= self.kpi_cont_uptime_target) if self.kpi_cont_uptime_target > 0 else True
+                        return cond_jl and cond_br and cond_ct
 
-                    # Histerese
                     if self._last_state in (None, "baseline"):
                         if _degrade_condition():
                             if self._last_change_ts == 0.0:
@@ -471,16 +519,16 @@ class UcvController(app_manager.RyuApp):
                                 self._last_change_ts = now
                         else:
                             self._last_change_ts = 0.0
-                    else:  # degraded
+                            state = "baseline"
+                    else:  # estava degradado
                         if _recover_condition():
                             if (now - self._last_change_ts) >= self.kpi_cooldown_s:
                                 state = "baseline"
                                 self._last_change_ts = now
                         else:
-                            # ainda degradado; reinicia cooldown
+                            state = "degraded"      # <— mantenha degradado
                             self._last_change_ts = now
 
-                # Aplica apenas em mudança de estado
                 if state != self._last_state:
                     prof = self.qos_profiles.get(state, {})
                     self.logger.info("[policy] Applying QoS profile '%s': %s", state, prof)

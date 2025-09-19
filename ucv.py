@@ -190,7 +190,6 @@ def main():
     # portas nas quais aplicar QoS (mesmas do controller/policy)
     qos_ifaces = policy.get("interfaces", ["s1-eth1","s1-eth2","s1-eth3","s1-eth4"])
 
-
     setLogLevel('info')
 
     # --- Cria rede ---
@@ -254,10 +253,10 @@ def main():
 
     # --- Mapeamento de interfaces para eventos ---
     iface_map = {
-        'ucv_to_gcs': 's1-eth1',   # C2: uplink/downlink HOST <-> OVS
-        'ucv_to_uav': 's1-eth2',   # C2: OVS <-> UAV
-        'video_to_host': 's1-eth3',# VÍDEO: OVS -> host (root-eth1)
-        'video_to_uav': 's1-eth4', # VÍDEO: OVS -> UAV (uav-eth1)
+        'ucv_to_gcs'   : 'root-eth0',  # C2 lado host (GCS)
+        'ucv_to_uav'   : 'uav-eth0',   # C2 lado UAV
+        'video_to_host': 'root-eth1',  # VÍDEO lado host (QGC)
+        'video_to_uav' : 'uav-eth1',   # VÍDEO lado UAV (câmera)
     }
 
     procs = []  # processos que vamos limpar no final
@@ -266,7 +265,7 @@ def main():
         #uav socat -dd -u UDP4-RECV:5600,bind=127.0.0.1,reuseaddr UDP4-SENDTO:10.1.0.254:5600,bind=10.1.0.2
         socat_cmd = (
             f"socat -dd -u "
-            f"UDP4-RECV:{args.video_listen_port},bind=127.0.0.1,reuseaddr "
+            f"UDP4-RECV:{args.video_listen_port},bind=127.0.0.1,reuseaddr,so-rcvbuf=2097152 "
             f"UDP4-SENDTO:{args.video_dest_ip}:{args.video_dest_port},bind={uav_video_ip} "
             "2>/tmp/ucv_video_socat.log;"
         )
