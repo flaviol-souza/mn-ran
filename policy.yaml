@@ -1,9 +1,19 @@
 detection_mode: kpi
-interfaces: ["s1-eth1", "s1-eth2", "s1-eth3", "s1-eth4"]
+interfaces: [s1-eth1, s1-eth2, s1-eth3, s1-eth4]  # [C2_host, C2_uav, VID_host, VID_uav]
+#  - s1-eth1   # C2: HOST(root-eth0) <-> OVS
+#  - s1-eth2   # C2: OVS <-> UAV (uav-eth0)
+#  - s1-eth3   # VÍDEO: OVS -> HOST (root-eth1)
+#  - s1-eth4   # VÍDEO: OVS -> UAV  (uav-eth1)
+qos_init_profile: baseline   # ou "degraded" para iniciar já apertado
 poll_seconds: 2
 
-iface_c2: s1-eth1 # porta OVS de referência para C2 (proxy de métricas on-line)
+iface_c2: "s1-eth1" # porta OVS de referência para C2 (proxy de métricas on-line)
 windows_ms: 5000 # janela para p95/bitrate (5 s)
+c2_expected_rate_hz: 50 # taxa de envio esperada de MAVLink na janela (Hz)
+
+#filtro unidirecional para amostrar apenas UAV -> HOST (uplink)
+c2_src_ip: "10.0.0.2"     # IP do UAV (origem dos pacotes)
+c2_dst_ip: "10.0.0.254"   # IP do HOST/QGC (destino dos pacotes)
 
 # metas/limiares + histerese (sem renomear chaves)
 kpi:

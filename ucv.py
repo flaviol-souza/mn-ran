@@ -171,6 +171,26 @@ def main():
 
     args = parser.parse_args()
 
+    # --- Carrega policy.yaml para unificar os perfis de QoS ---
+    policy_file = os.environ.get("UCV_POLICY", "policy.yaml")
+    policy = {}
+    if HAVE_YAML and Path(policy_file).exists():
+        with open(policy_file, "r") as f:
+            policy = yaml.safe_load(f) or {}
+
+    qos_profiles = policy.get("qos_profiles", {
+        "baseline": {"q0_min": 2_000_000, "q0_max": 5_000_000,
+                    "q1_min":   500_000, "q1_max": 98_000_000},
+        "degraded": {"q0_min": 4_000_000, "q0_max": 8_000_000,
+                    "q1_min":   200_000, "q1_max":  5_000_000}
+    })
+    init_profile = policy.get("qos_init_profile", "baseline")
+    profile = qos_profiles.get(init_profile, list(qos_profiles.values())[0])
+
+    # portas nas quais aplicar QoS (mesmas do controller/policy)
+    qos_ifaces = policy.get("interfaces", ["s1-eth1","s1-eth2","s1-eth3","s1-eth4"])
+
+
     setLogLevel('info')
 
     # --- Cria rede ---
@@ -214,17 +234,16 @@ def main():
     root.cmd('ip addr add 10.0.0.254/24 dev root-eth0')
     root.cmd('ip link set root-eth0 up')
 
-    # --- QoS no OVS (duas filas) ---
-    info('*** Configurando QoS/Queues no OVS\n')
-    # valores exemplo (ajuste conforme cenário)
-    rates = dict(
-        max_rate=int(args.bw * 1_000_000),  # bps
-        q0_min=2_000_000,   # C2 garantido
-        q0_max=5_000_000,
-        q1_min=500_000,     # ISR mínimo
-        q1_max=int(args.bw * 1_000_000) - 2_000_000
-    )
-    apply_qos_ovs('s1', ['s1-eth1','s1-eth2','s1-eth3','s1-eth4'], rates)
+    # --- QoS no OVS (duas filas) puxando de policy.yaml ---
+    info('*** Configurando QoS/Queues no OVS (policy.yaml)\n')
+    rates = {
+        "max_rate": int(args.bw * 1_000_000),  # largura de banda nominal do link (bps)
+        "q0_min": int(profile.get("q0_min", 2_000_000)),
+        "q0_max": int(profile.get("q0_max", 5_000_000)),
+        "q1_min": int(profile.get("q1_min",   500_000)),
+        "q1_max": int(profile.get("q1_max", 98_000_000)),
+    }
+    apply_qos_ovs('s1', qos_ifaces, rates)
 
     # --- Marcação DSCP para C2 (no UAV e no GCS) ---
     info('*** Marcando DSCP EF (46) para tráfego C2 (UDP/14550)\n')
