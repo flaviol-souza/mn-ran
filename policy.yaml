@@ -1,4 +1,4 @@
-detection_mode: netem
+detection_mode: kpi
 interfaces: [s1-eth1, s1-eth2, s1-eth3, s1-eth4]  # [C2_host, C2_uav, VID_host, VID_uav]
 #  - s1-eth1   # C2: HOST(root-eth0) <-> OVS
 #  - s1-eth2   # C2: OVS <-> UAV (uav-eth0)

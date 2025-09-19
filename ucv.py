@@ -31,6 +31,20 @@ def sh(cmd: str, shell=True, check=True):
     info(f'*** $ {cmd}\n')
     return subprocess.run(cmd, shell=shell, check=check)
 
+def apply_netem_on(host, intf: str, params: dict, action='add'):
+    """Aplica netem dentro do namespace do *host* (Mininet)."""
+    if action == 'del':
+        host.cmd(f"tc qdisc del dev {intf} root || true")
+        return
+
+    delay  = params.get('delay_ms')
+    jitter = params.get('jitter_ms')
+    loss   = params.get('loss_pct')
+    rate   = params.get('rate_mbit')
+
+    cmd = netem_cmd(intf, delay, jitter, loss, rate, action=('change' if action=='change' else 'add'))
+    host.cmd(cmd)
+
 def apply_qos_ovs(bridge: str, ifaces, rates):
     """
     Configura QoS HTB e duas filas em cada interface egress do OVS.
@@ -103,7 +117,7 @@ def apply_netem(intf: str, params: dict, action='add'):
     cmd = netem_cmd(intf, delay, jitter, loss, rate, action=('change' if action=='change' else 'add'))
     sh(cmd)
 
-def run_events(events_file: str, iface_map: dict, start_time: float):
+def run_events(events_file: str, iface_map: dict, host_map: dict, start_time: float):
     """
     Lê events.yaml e aplica netem/cortes conforme timeline.
     Formato exemplo:
@@ -128,14 +142,29 @@ def run_events(events_file: str, iface_map: dict, start_time: float):
     for ev in events:
         t = float(ev.get('at', 0))
 
-        # aceitar 'target' (preferência) ou 'iface' (compatibilidade)
+        # Preferir 'target' simbólico; aceitar 'iface' como fallback
+        host = None
+        intf = None
         if 'target' in ev:
-            intf = iface_map.get(ev.get('target'))
+            mapping = iface_map.get(ev.get('target'))
+            if isinstance(mapping, tuple) and len(mapping) == 2:
+                host = host_map.get(mapping[0])
+                intf = mapping[1]
+            else:
+                # mapeamento antigo só com string de interface
+                intf = mapping
         else:
             intf = ev.get('iface')
 
-        if not intf:
-            info(f'*** [WARN] evento sem target/iface mapeado: {ev}\n')
+        # Inferência automática de host se vier só a interface
+        if host is None and isinstance(intf, str):
+            if intf.startswith('uav-'):
+                host = host_map.get('uav')
+            elif intf.startswith('root-'):
+                host = host_map.get('root')
+
+        if not host or not intf:
+            info(f'*** [WARN] evento sem host/intf válido: {ev}\n')
             continue
 
         # Espera até o tempo do evento
@@ -146,14 +175,14 @@ def run_events(events_file: str, iface_map: dict, start_time: float):
 
         if ev.get('clear'):
             info(f'*** [{t:.2f}s] CLEAR netem em {intf}\n')
-            apply_netem(intf, {}, action='del')
+            apply_netem_on(host, intf, {}, action='del')
         else:
             params = ev.get('netem', {})
             info(f'*** [{t:.2f}s] APPLY netem em {intf}: {params}\n')
-            # se já existe, use change; senão add (tentamos change e caímos em add)
-            rc = subprocess.run(f"tc qdisc show dev {intf} | grep netem", shell=True)
-            action = 'change' if rc.returncode == 0 else 'add'
-            apply_netem(intf, params, action=action)
+            # se já existe, usar change; senão add
+            rc = host.cmd(f"tc qdisc show dev {intf} | grep -q netem ; echo $?").strip()
+            action = 'change' if rc == '0' else 'add'
+            apply_netem_on(host, intf, params, action=action)
 
 def main():
     parser = argparse.ArgumentParser(description="UCV Mininet Experiment")
@@ -170,6 +199,14 @@ def main():
     parser.add_argument('--video_dest_port', type=int, default=5600)
 
     args = parser.parse_args()
+
+    # --- Pré-clean para evitar "RTNETLINK: File exists" ao recriar a topo ---
+    info('*** Pre-clean Mininet/OVS/ifaces\n')
+    subprocess.run('mn -c', shell=True, check=False)
+    subprocess.run('ovs-vsctl --if-exists del-br s1', shell=True, check=False)
+    for dev in ('root-eth0','root-eth1','uav-eth0','uav-eth1'):
+        subprocess.run(f'ip link del {dev}', shell=True, check=False)
+
 
     # --- Carrega policy.yaml para unificar os perfis de QoS ---
     policy_file = os.environ.get("UCV_POLICY", "policy.yaml")
@@ -253,14 +290,14 @@ def main():
 
     # --- Mapeamento de interfaces para eventos ---
     iface_map = {
-        'ucv_to_gcs'   : 'root-eth0',  # C2 lado host (GCS)
-        'ucv_to_uav'   : 'uav-eth0',   # C2 lado UAV
-        'video_to_host': 'root-eth1',  # VÍDEO lado host (QGC)
-        'video_to_uav' : 'uav-eth1',   # VÍDEO lado UAV (câmera)
+        'ucv_to_gcs'   : ('root', 'root-eth0'),  # C2 lado host (GCS)
+        'ucv_to_uav'   : ('uav',  'uav-eth0'),   # C2 lado UAV
+        'video_to_host': ('root', 'root-eth1'),  # VÍDEO lado host (QGC)
+        'video_to_uav' : ('uav',  'uav-eth1'),   # VÍDEO lado UAV (câmera)
     }
+    host_map = {'root': root, 'uav': uav}
 
     procs = []  # processos que vamos limpar no final
-
     if args.video_relay:
         #uav socat -dd -u UDP4-RECV:5600,bind=127.0.0.1,reuseaddr UDP4-SENDTO:10.1.0.254:5600,bind=10.1.0.2
         socat_cmd = (
@@ -273,20 +310,16 @@ def main():
         p = uav.popen(socat_cmd, shell=True)
         procs.append(('uav_socat5600', p))
 
-
-
     # --- Scheduler de eventos (thread) ---
     if args.events and Path(args.events).exists():
         info(f'*** Carregando eventos de {args.events}\n')
         t0 = time.time()
-        th = threading.Thread(target=run_events, args=(args.events, iface_map, t0), daemon=True)
+        th = threading.Thread(target=run_events, args=(args.events, iface_map, host_map, t0), daemon=True)
         th.start()
     else:
         info('*** Sem arquivo de eventos; execução contínua.\n')
 
     info('*** Pronto. Use ping entre hosts ou rode seus apps (PX4/QGC) nos hosts Mininet.\n')
-    info('    Ex.: mininet> root ping -c 3 10.0.0.2\n')
-
     if args.start_cli:
         CLI(net)
     else:
