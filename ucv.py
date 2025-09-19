@@ -224,7 +224,7 @@ def main():
         q1_min=500_000,     # ISR mínimo
         q1_max=int(args.bw * 1_000_000) - 2_000_000
     )
-    apply_qos_ovs('s1', ['s1-eth1', 's1-eth2', 's1-eth3', 's1-eth4' ], rates)
+    apply_qos_ovs('s1', ['s1-eth1','s1-eth2','s1-eth3','s1-eth4'], rates)
 
     # --- Marcação DSCP para C2 (no UAV e no GCS) ---
     info('*** Marcando DSCP EF (46) para tráfego C2 (UDP/14550)\n')
@@ -244,10 +244,12 @@ def main():
     procs = []  # processos que vamos limpar no final
 
     if args.video_relay:
+        #uav socat -dd -u UDP4-RECV:5600,bind=127.0.0.1,reuseaddr UDP4-SENDTO:10.1.0.254:5600,bind=10.1.0.2
         socat_cmd = (
-            f"socat -d -d -u "
-            f"UDP4-RECV:{args.video_listen_port},reuseaddr,ipv6only=0 "
-            f"UDP4-SENDTO:{args.video_dest_ip}:{args.video_dest_port}"
+            f"socat -dd -u "
+            f"UDP4-RECV:{args.video_listen_port},bind=127.0.0.1,reuseaddr "
+            f"UDP4-SENDTO:{args.video_dest_ip}:{args.video_dest_port},bind={uav_video_ip} "
+            "2>/tmp/ucv_video_socat.log;"
         )
         info(f'*** Iniciando relé de vídeo no UAV: {socat_cmd}\n')
         p = uav.popen(socat_cmd, shell=True)
