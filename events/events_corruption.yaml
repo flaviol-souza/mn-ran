@@ -1,0 +1,8 @@
+# events_corruption.yaml
+- at: 55.0
+  target: video_to_host
+  netem: { corrupt_pct: 0.05 }
+  
+- at: 85.0
+  target: video_to_host
+  clear: true

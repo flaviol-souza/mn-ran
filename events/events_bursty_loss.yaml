@@ -1,0 +1,16 @@
+# events_bursty_loss.yaml
+- at: 20.0
+  target: ucv_to_gcs     # C2 UAV->GCS
+  netem: { loss_pct: 1.5, corr_pct: 60, jitter_ms: 5 }
+
+- at: 50.0
+  target: ucv_to_gcs
+  clear: true
+
+- at: 70.0
+  target: video_to_host  # vídeo UAV->GCS
+  netem: { loss_pct: 3.0, corr_pct: 70 }
+
+- at: 100.0
+  target: video_to_host
+  clear: true

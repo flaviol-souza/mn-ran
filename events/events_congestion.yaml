@@ -1,0 +1,16 @@
+# events_congestion.yaml
+- at: 30.0
+  target: video_to_host         # root-eth1 (UAV->GCS vídeo)
+  netem: { delay_ms: 120, jitter_ms: 30, rate_mbit: 5 }
+
+- at: 60.0
+  target: video_to_host
+  clear: true
+
+- at: 90.0
+  target: ucv_to_gcs            # root-eth0 (UAV->GCS C2)
+  netem: { delay_ms: 120, jitter_ms: 30, rate_mbit: 5 }
+
+- at: 120.0
+  target: ucv_to_gcs
+  clear: true
