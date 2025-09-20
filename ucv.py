@@ -25,15 +25,14 @@ from mininet.cli import CLI
 from mininet.log import setLogLevel, info
 
 # ---------- Helpers ----------
-
-def make_run_dir(events_path=None, run_dir=None):
-    if run_dir:
-        Path(run_dir).mkdir(parents=True, exist_ok=True)
-        return run_dir
+def _init_run_dir(policy):
+    rd = policy.get("run_dir")
+    if rd:
+        os.makedirs(rd, exist_ok=True)
+        return rd
     ts = time.strftime("%Y%m%d-%H%M%S")
-    base = Path(events_path).stem if events_path else "manual"
-    rd = f"/tmp/runs/{ts}_{base}"
-    Path(rd).mkdir(parents=True, exist_ok=True)
+    rd =+ "/" + ts + "/"
+    os.makedirs(rd, exist_ok=True)
     return rd
 
 def sh(cmd: str, shell=True, check=True):
@@ -237,8 +236,7 @@ def main():
 
     args = parser.parse_args()
 
-    RUN_DIR = make_run_dir(args.events, args.run_dir)
-    print(f"*** Run dir: {RUN_DIR}")
+    
 
     # --- Pré-clean para evitar "RTNETLINK: File exists" ao recriar a topo ---
     info('*** Pre-clean Mininet/OVS/ifaces\n')
@@ -254,6 +252,9 @@ def main():
     if HAVE_YAML and Path(policy_file).exists():
         with open(policy_file, "r") as f:
             policy = yaml.safe_load(f) or {}
+    
+    run_dir = _init_run_dir(policy)
+    print(f"*** Run dir: {run_dir}")
 
     qos_profiles = policy.get("qos_profiles", {
         "baseline": {"q0_min": 2_000_000, "q0_max": 5_000_000,
@@ -263,7 +264,6 @@ def main():
     })
     init_profile = policy.get("qos_init_profile", "baseline")
     profile = qos_profiles.get(init_profile, list(qos_profiles.values())[0])
-    run_dir = policy.get("run_dir", "logs")
     # portas nas quais aplicar QoS (mesmas do controller/policy)
     qos_ifaces = policy.get("interfaces", ["s1-eth1","s1-eth2","s1-eth3","s1-eth4"])
 
@@ -344,7 +344,7 @@ def main():
             f"socat -dd -u "
             f"UDP4-RECV:{args.video_listen_port},bind=127.0.0.1,reuseaddr,so-rcvbuf=2097152 "
             f"UDP4-SENDTO:{args.video_dest_ip}:{args.video_dest_port},bind={uav_video_ip} "
-            f"2>{RUN_DIR}/video_socat.log;"
+            f"2>{run_dir}/video_socat.log;"
         )
         info(f'*** Iniciando relé de vídeo no UAV: {socat_cmd}\n')
         p = uav.popen(socat_cmd, shell=True)

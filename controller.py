@@ -1,25 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import re
-import yaml
-import time
-import json
-import math
-import queue
-import shlex
-import signal
-import logging
-import subprocess
+import os, re, yaml, time, json, math, queue, shlex, signal, logging, subprocess, glob
 from collections import deque
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import MAIN_DISPATCHER, CONFIG_DISPATCHER, set_ev_cls
+from ryu.controller.handler import MAIN_DISPATCHER, CONFIG_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
-
 
 # --------- Utilidades simples ---------
 def _resolve_out(run_dir, path, default_name):
@@ -32,6 +21,12 @@ def _resolve_out(run_dir, path, default_name):
     if not os.path.isabs(path):
         return os.path.join(run_dir, path)
     return path
+
+def _iface_exists(name: str) -> bool:
+    return os.path.isdir(f"/sys/class/net/{name}")
+
+def _ensure_dir(d: str):
+    os.makedirs(d, exist_ok=True)
 
 def _pct(p, total):
     if total <= 0:
@@ -59,10 +54,12 @@ def run_cmd(cmd):
     return proc.returncode, out.strip(), err.strip()
 
 def _init_run_dir(policy):
-    rd = os.environ.get("UCV_RUN_DIR", "").strip()
-    if not rd:
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        rd = policy.get("run_dir", f"/tmp/runs/{ts}_controller")
+    rd = policy.get("run_dir")
+    if rd:
+        os.makedirs(rd, exist_ok=True)
+        return rd
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    rd =+ "/" + ts + "/"
     os.makedirs(rd, exist_ok=True)
     return rd
 
@@ -173,7 +170,7 @@ class UcvController(app_manager.RyuApp):
         self.video_src_ip  = self.policy.get("video_src_ip", "10.1.0.2")
         self.video_dst_ip  = self.policy.get("video_dst_ip", "10.1.0.254")
         
-        self.kpi_if        = self.policy.get("iface_c2", self.interfaces[0] if self.interfaces else "s1-eth1")
+        self.kpi_if   = self.policy.get("iface_c2", "s1-eth1")
         self.kpi_window_ms = int(self.policy.get("window_ms", 5000))
 
         # taxa esperada de MAVLink (Hz)
@@ -219,15 +216,7 @@ class UcvController(app_manager.RyuApp):
         # PCAP: ativar/desativar
         self.enable_pcap = bool(self.policy.get("pcap_enable", True))
         self._pcap_procs = []
-
-        # iniciar coletores
-        if self.enable_pcap:
-            self._spawn_pcap(self.kpi_if,
-                            f"udp dst port 14550 and src host {self.c2_src_ip} and dst host {self.c2_dst_ip}" if (self.c2_src_ip and self.c2_dst_ip) else "udp port 14550",
-                            os.path.join(self.run_dir, "c2.pcapng"))
-            self._spawn_pcap(self.video_if,
-                            f"udp dst port 5600 and src host {self.video_src_ip} and dst host {self.video_dst_ip}" if (self.video_src_ip and self.video_dst_ip) else "udp port 5600",
-                            os.path.join(self.run_dir, "video.pcapng"))          
+        self._pcap_started = False
 
         # buffers / métricas atuais
         self._kpi_timestamps = deque()
@@ -252,7 +241,11 @@ class UcvController(app_manager.RyuApp):
         self._qos_thr  = hub.spawn(self._qos_sampler)
 
     # ---------- OpenFlow setup ----------
-
+    @set_ev_cls(ofp_event.EventOFPStateChange, [DEAD_DISPATCHER])
+    def _switch_down(self, ev):
+        # Switch caiu? pare os pcaps para evitar “adapter no longer attached”
+        self._stop_pcaps()
+        
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         """Instala fluxos proativos com SAÍDA EXPLÍCITA por porta.
@@ -302,19 +295,85 @@ class UcvController(app_manager.RyuApp):
         pretty = {k: v for k, v in sorted(mp.items()) if k.startswith('s1-eth')}
         self.logger.info("[flows] PortDesc recebido (nome->port_no): %s", pretty)
         self._install_queued_flows(dp)
+        self._start_pcaps_if_needed()
 
-    def _spawn_pcap(self, iface, bpf, outfile):
+    def _spawn_pcap(self, iface: str, bpf: str, outfile: str):
+        # garante caminho absoluto
+        outfile = os.path.abspath(outfile)
+        outdir = os.path.dirname(outfile)
+        _ensure_dir(outdir)
+
+        if not _iface_exists(iface):
+            self.logger.warning("[pcap] iface %s ainda não existe; adiando", iface)
+            return False
+
+        # dumpcap ring; -q = quiet (não afeta escrita), -b = ring (50 MB, 4 arquivos)
         cmd = (
-            f"tshark -i {shlex.quote(iface)} -f \"{bpf}\" "
-            f"-w {shlex.quote(outfile)} "
-            f"-b filesize:50000 -b files:4 " #f"-b filesize:50 -b files:4 -q"
+            f'dumpcap -q -i {shlex.quote(iface)} -f "{bpf}" '
+            f'-w {shlex.quote(outfile)} -b filesize:50000 -b files:4'
         )
+        self.logger.info("[pcap] launching: %s", cmd)
+
+        # log de erro do dumpcap vai para um arquivo ao lado do pcap
+        errlog = outfile + ".stderr.log"
         try:
-            p = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self._pcap_procs.append(p)
-            self.logger.info("[pcap] %s -> %s (ring)", iface, outfile)
+            with open(errlog, "ab", buffering=0) as errfp:
+                p = subprocess.Popen(
+                    cmd, shell=True,
+                    stdout=subprocess.DEVNULL, stderr=errfp, preexec_fn=os.setsid
+                )
         except Exception as e:
-            self.logger.warning("[pcap] falhou: %s", e)
+            self.logger.error("[pcap] falhou ao iniciar (%s): %s", iface, e)
+            return False
+
+        # watchdog rápido: em até 2s o proc não pode ter morrido
+        # e o dumpcap costuma criar o primeiro arquivo do ring imediatamente.
+        hub.sleep(0.5)
+        if p.poll() is not None:
+            self.logger.error("[pcap] processo encerrou cedo (rc=%s). Veja %s", p.returncode, errlog)
+            return False
+
+        # Nomeação do ring: dumpcap cria arquivos com sufixo numérico:
+        #   <base>_00001_YYYY...pcapng
+        # então validamos por prefixo "<outfile>_00001".
+        base_prefix = outfile + "_00001"
+        found = glob.glob(base_prefix + "*.pcapng")
+        if not found:
+            # ainda pode estar criando — espera mais um pouco
+            hub.sleep(1.5)
+            found = glob.glob(base_prefix + "*.pcapng")
+        if not found:
+            self.logger.warning("[pcap] não encontrei arquivo do ring ainda (prefixo=%s); seguirei assim mesmo", base_prefix)
+
+        self._pcap_procs.append(p)
+        self.logger.info("[pcap] %s -> %s (ring ativo)", iface, outfile)
+        return True
+
+
+    def _start_pcaps_if_needed(self):
+        if not self.enable_pcap or self._pcap_started:
+            return
+
+        bpf_c2 = (f"udp dst port 14550 and src host {self.c2_src_ip} and dst host {self.c2_dst_ip}"
+                if (self.c2_src_ip and self.c2_dst_ip) else "udp port 14550")
+        bpf_vid = (f"udp dst port 5600 and src host {self.video_src_ip} and dst host {self.video_dst_ip}"
+                if (self.video_src_ip and self.video_dst_ip) else "udp port 5600")
+
+        ok1 = self._spawn_pcap(self.kpi_if, bpf_c2,  os.path.join(self.run_dir, "c2.pcapng"))
+        ok2 = self._spawn_pcap(self.video_if, bpf_vid, os.path.join(self.run_dir, "video.pcapng"))
+        self._pcap_started = bool(ok1 and ok2)
+
+    def _stop_pcaps(self):
+        for p in self._pcap_procs:
+            try:
+                p.terminate()
+            except Exception as e:
+                self.logger.exception("[pcap] erro ao encerrar: %s", e)
+                pass
+        self._pcap_procs = []
+        self._pcap_started = False
+        self.logger.info("[pcap] encerrados")
+
 
     def _install_queued_flows(self, dp):
         """Instala fluxos com set_queue + Output(port_no) para C2 e Vídeo."""
@@ -573,21 +632,33 @@ class UcvController(app_manager.RyuApp):
         rc, out, _ = run_cmd(f"ovs-appctl qos/show {shlex.quote(iface)}")
         if rc != 0 or not out.strip():
             return None
-        # formato: seções "Default:" e "Queue 1:" etc.
+
         stats = {}
-        cur = None
+        cur = None  # "q0" (Default) ou "q1" (Queue 1), etc.
         for line in out.splitlines():
             line = line.strip()
             if line.startswith("Default:"):
                 cur = "q0"
+                stats.setdefault(cur, {})
             elif line.startswith("Queue "):
-                # "Queue 1:" => q1
-                qn = line.split()[1].rstrip(":")
+                qn = line.split()[1].rstrip(":")  # "1:" -> "1"
                 cur = f"q{qn}"
-            elif "tx_packets:" in line and cur:
-                stats.setdefault(cur, {})["tx_packets"] = int(line.split(":")[1].strip())
-            elif "tx_bytes:" in line and cur:
-                stats.setdefault(cur, {})["tx_bytes"] = int(line.split(":")[1].strip())
+                stats.setdefault(cur, {})
+            elif cur:
+                if "min-rate:" in line:
+                    stats[cur]["min_rate"] = int(line.split(":")[1].strip())
+                elif "max-rate:" in line:
+                    stats[cur]["max_rate"] = int(line.split(":")[1].strip())
+                elif "tx_packets:" in line:
+                    stats[cur]["tx_packets"] = int(line.split(":")[1].strip())
+                elif "tx_bytes:" in line:
+                    stats[cur]["tx_bytes"] = int(line.split(":")[1].strip())
+
+        # Preenche zeros se counters não existirem
+        for k in list(stats.keys()):
+            stats[k].setdefault("tx_packets", 0)
+            stats[k].setdefault("tx_bytes", 0)
+
         return stats or None
 
     def _qos_sampler(self):
@@ -710,7 +781,6 @@ class UcvController(app_manager.RyuApp):
 
                     self._last_state = state
 
-
             except Exception as e:
                 self.logger.exception("[policy] loop error: %s", e)
 
@@ -726,7 +796,6 @@ class UcvController(app_manager.RyuApp):
                 p.terminate()
             except Exception:
                 pass
-
 
         # ---------- Helpers de portas ----------
     def _get_ofport(self, ifname: str):

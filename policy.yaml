@@ -9,7 +9,7 @@ poll_seconds: 2
 iface_c2: "s1-eth1" # porta OVS de referência para C2 (proxy de métricas on-line)
 iface_video: "s1-eth3"
 
-run_dir: "logs"                 # opcional; se vazio, usa UCV_RUN_DIR ou /tmp/runs/<ts>_controller
+run_dir: "/tmp/runs" # opcional; se vazio, usa UCV_RUN_DIR ou /tmp/runs/<ts>_controller
 pcap_enable: true
 video_export_jsonl_path: "logs"   # se vazio, cai em <run_dir>/controller_video_kpi.jsonl
 
