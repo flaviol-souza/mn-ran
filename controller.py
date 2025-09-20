@@ -22,6 +22,16 @@ from ryu.lib import hub
 
 
 # --------- Utilidades simples ---------
+def _resolve_out(run_dir, path, default_name):
+    if not path:
+        return os.path.join(run_dir, default_name)
+    # se for diretório, gravo com nome padrão dentro dele
+    if os.path.isdir(path):
+        return os.path.join(path, default_name)
+    # se for relativo, junto com run_dir
+    if not os.path.isabs(path):
+        return os.path.join(run_dir, path)
+    return path
 
 def _pct(p, total):
     if total <= 0:
@@ -47,6 +57,21 @@ def run_cmd(cmd):
     )
     out, err = proc.communicate()
     return proc.returncode, out.strip(), err.strip()
+
+def _init_run_dir(policy):
+    rd = os.environ.get("UCV_RUN_DIR", "").strip()
+    if not rd:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        rd = policy.get("run_dir", f"/tmp/runs/{ts}_controller")
+    os.makedirs(rd, exist_ok=True)
+    return rd
+
+def _append_jsonl(path, rec: dict):
+    try:
+        with open(path, "a") as fp:
+            fp.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
 
 def has_netem(intf):
     """Detecta se há qdisc netem ativo naquela interface."""
@@ -110,15 +135,28 @@ class UcvController(app_manager.RyuApp):
         policy_file = os.environ.get("UCV_POLICY", "policy.yaml")
         with open(policy_file, "r") as f:
             self.policy = yaml.safe_load(f) or {}
+        self.run_dir = _init_run_dir(self.policy)
+
+        kpi_blk = self.policy.get("kpi", {})
+        ent = kpi_blk.get("enter", {})
+        exi = kpi_blk.get("exit", {})
 
         # Interfaces onde aplicar QoS/filas (devem ter QoS criado pelo ucv.py)
-        self.interfaces = self.policy.get("interfaces", ["s1-eth2", "s1-eth3"])
+        self.interfaces = self.policy.get("interfaces", ["s1-eth1", "s1-eth2", "s1-eth3", "s1-eth4"])
         self.intf_to_portno = {}
         self._flows_installed = False
         self._policy_stop = False
         self._last_state = None        # último perfil aplicado: "baseline" ou "degraded"
         self._last_change_ts = 0.0     # timestamp da última troca (para hold/cooldown)
 
+        self.kpi_export = _resolve_out(self.run_dir,
+                               kpi_blk.get("export_jsonl_path", ""),
+                               "controller_c2_kpi.jsonl")
+
+        self.video_export = _resolve_out(self.run_dir,
+                                        self.policy.get("video_export_jsonl_path", ""),
+                                        "controller_video_kpi.jsonl")
+        
         # Perfiles de QoS (HTB) por estado
         self.qos_profiles = self.policy.get("qos_profiles", {
             "baseline": {"q0_min": 2_000_000, "q0_max": 5_000_000,
@@ -127,20 +165,23 @@ class UcvController(app_manager.RyuApp):
                          "q1_min":   200_000, "q1_max":  5_000_000}
         })
 
+        self.qos_init_profile = self.policy.get("qos_init_profile", "baseline")
         self.detection_mode = self.policy.get("detection_mode", "kpi").lower()
         self.poll_seconds   = int(self.policy.get("poll_seconds", 2))
 
-        # KPI (tempo real) config
-        kpi_blk = self.policy.get("kpi", {})
-        ent = kpi_blk.get("enter", {})
-        exi = kpi_blk.get("exit", {})
-
+        self.video_if      = self.policy.get("iface_video", "s1-eth3")
+        self.video_src_ip  = self.policy.get("video_src_ip", "10.1.0.2")
+        self.video_dst_ip  = self.policy.get("video_dst_ip", "10.1.0.254")
+        
         self.kpi_if        = self.policy.get("iface_c2", self.interfaces[0] if self.interfaces else "s1-eth1")
         self.kpi_window_ms = int(self.policy.get("window_ms", 5000))
 
         # taxa esperada de MAVLink (Hz)
         self.c2_rate_hz    = float(self.policy.get("c2_expected_rate_hz", 50.0))
         self._kpi_continuity_up_pct = 100.0
+        self._vid_lock = hub.Semaphore(1)
+        self._vid_bitrate_mbps = 0.0
+
         self.kpi_degrade_jit  = float(ent.get("jitter_p95_ms", 30.0))
         self.kpi_degrade_loss = float(ent.get("loss_p95_pct", 1.0))
         self.kpi_degrade_bps  = float(ent.get("bitrate_floor_mbps", 0.0))  # Mbps (0 = ignorar)
@@ -150,6 +191,10 @@ class UcvController(app_manager.RyuApp):
         self.kpi_recover_loss = float(exi.get("loss_p95_pct", 0.5))
         self.kpi_recover_bps  = float(exi.get("bitrate_floor_mbps", 0.0))  # Mbps (0 = ignorar)
         self.kpi_cooldown_s   = float(exi.get("cooldown_s", 10.0))
+
+         # IPs para filtro unidirecional UAV->HOST
+        self.c2_src_ip     = self.policy.get("c2_src_ip", None)  # UAV
+        self.c2_dst_ip     = self.policy.get("c2_dst_ip", None)  # HOST/QGC   
 
         # período do C2 em ms
         T_ms = 1000.0 / max(1e-6, self.c2_rate_hz)
@@ -171,12 +216,18 @@ class UcvController(app_manager.RyuApp):
         # alvo de continuidade para decisão/relato
         self.kpi_cont_uptime_target = float(kpi_blk.get("continuity_min_uptime_pct", 0.0))
 
-        # export JSONL
-        self.kpi_export = kpi_blk.get("export_jsonl_path", None)
+        # PCAP: ativar/desativar
+        self.enable_pcap = bool(self.policy.get("pcap_enable", True))
+        self._pcap_procs = []
 
-        # IPs para filtro unidirecional UAV->HOST
-        self.c2_src_ip     = self.policy.get("c2_src_ip", None)  # UAV
-        self.c2_dst_ip     = self.policy.get("c2_dst_ip", None)  # HOST/QGC       
+        # iniciar coletores
+        if self.enable_pcap:
+            self._spawn_pcap(self.kpi_if,
+                            f"udp dst port 14550 and src host {self.c2_src_ip} and dst host {self.c2_dst_ip}" if (self.c2_src_ip and self.c2_dst_ip) else "udp port 14550",
+                            os.path.join(self.run_dir, "c2.pcapng"))
+            self._spawn_pcap(self.video_if,
+                            f"udp dst port 5600 and src host {self.video_src_ip} and dst host {self.video_dst_ip}" if (self.video_src_ip and self.video_dst_ip) else "udp port 5600",
+                            os.path.join(self.run_dir, "video.pcapng"))          
 
         # buffers / métricas atuais
         self._kpi_timestamps = deque()
@@ -197,6 +248,8 @@ class UcvController(app_manager.RyuApp):
             self._kpi_thr = hub.spawn(self._kpi_collector)
 
         self._policy_thr = hub.spawn(self._policy_loop)
+        self._vid_thr  = hub.spawn(self._video_collector)
+        self._qos_thr  = hub.spawn(self._qos_sampler)
 
     # ---------- OpenFlow setup ----------
 
@@ -249,6 +302,19 @@ class UcvController(app_manager.RyuApp):
         pretty = {k: v for k, v in sorted(mp.items()) if k.startswith('s1-eth')}
         self.logger.info("[flows] PortDesc recebido (nome->port_no): %s", pretty)
         self._install_queued_flows(dp)
+
+    def _spawn_pcap(self, iface, bpf, outfile):
+        cmd = (
+            f"tshark -i {shlex.quote(iface)} -f \"{bpf}\" "
+            f"-w {shlex.quote(outfile)} "
+            f"-b filesize:50000 -b files:4 " #f"-b filesize:50 -b files:4 -q"
+        )
+        try:
+            p = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._pcap_procs.append(p)
+            self.logger.info("[pcap] %s -> %s (ring)", iface, outfile)
+        except Exception as e:
+            self.logger.warning("[pcap] falhou: %s", e)
 
     def _install_queued_flows(self, dp):
         """Instala fluxos com set_queue + Output(port_no) para C2 e Vídeo."""
@@ -395,7 +461,7 @@ class UcvController(app_manager.RyuApp):
 
                 # atualiza ~10 Hz
                 now = ts
-                if (now - last_stats_ts) >= 0.1:
+                if (now - last_stats_ts) >= 0.2:
                     last_stats_ts = now
                     n = len(times)
 
@@ -430,6 +496,16 @@ class UcvController(app_manager.RyuApp):
                         self._kpi_bitrate_mbps = float(bitrate_mbps)
                         self._kpi_continuity_up_pct = float(continuity_uptime_pct)
 
+                    if self.kpi_export:
+                        _append_jsonl(self.kpi_export, {
+                            "ts": now,
+                            "n": n,
+                            "jitter_p95_ms": float(jitter_p95),
+                            "loss_pct": float(loss_pct),
+                            "bitrate_mbps": float(bitrate_mbps),
+                            "continuity_uptime_pct": float(continuity_uptime_pct)
+                        })
+
         except Exception as e:
             self.logger.exception("[kpi] collector error: %s", e)
         finally:
@@ -438,27 +514,106 @@ class UcvController(app_manager.RyuApp):
             except Exception:
                 pass
 
-        if self.kpi_export:
-            try:
-                rec = {
-                    "ts": now,
-                    "n": n,
-                    "jitter_p95_ms": float(jitter_p95),
-                    "loss_pct": float(loss_pct),
-                    "bitrate_mbps": float(bitrate_mbps),
-                    "continuity_uptime_pct": float(continuity_uptime_pct)
-                }
-                with open(self.kpi_export, "a") as fp:
-                    fp.write(json.dumps(rec) + "\n")
-            except Exception:
-                pass
+    def _video_collector(self):
+        """Bitrate do vídeo (UDP/5600) na janela self.kpi_window_ms."""
+        import shutil
+        if shutil.which("tshark") is None:
+            self.logger.warning("[video] tshark ausente; sem coleta de bitrate de vídeo")
+            return
 
+        window_ms = max(500, self.kpi_window_ms)
+        window_s = window_ms / 1000.0
+        bpf = (f"udp dst port 5600 and src host {self.video_src_ip} and dst host {self.video_dst_ip}"
+            if (self.video_src_ip and self.video_dst_ip) else "udp port 5600")
+        cmd = f'tshark -l -i {shlex.quote(self.video_if)} -f "{bpf}" -T fields -e frame.time_epoch -e frame.len'
+        self.logger.info("[video] starting tshark on iface=%s bpf='%s'", self.video_if, bpf)
+
+        try:
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except Exception as e:
+            self.logger.warning("[video] não iniciou tshark: %s", e); return
+
+        times, sizes = deque(), deque()
+        last_emit = 0.0
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                parts = line.strip().split()
+                if len(parts) < 2:
+                    continue
+                try:
+                    ts = float(parts[0]); ln = int(parts[1])
+                except Exception:
+                    continue
+
+                times.append(ts); sizes.append(ln)
+                cutoff = ts - window_s
+                while times and times[0] < cutoff:
+                    times.popleft(); sizes.popleft()
+
+                if ts - last_emit >= 0.2:
+                    last_emit = ts
+                    total_bytes = sum(sizes)
+                    bitrate_mbps = (total_bytes * 8.0) / (window_s * 1e6)
+                    pps = len(times) / window_s if window_s > 0 else 0.0
+                    rec = {"ts": ts, "bitrate_mbps": round(bitrate_mbps, 3), "pps": round(pps, 1)}
+                    _append_jsonl(self.video_export, rec)
+                    with self._vid_lock:
+                        self._vid_bitrate_mbps = float(bitrate_mbps)
+
+        except Exception as e:
+            self.logger.exception("[video] collector error: %s", e)
+        finally:
+            try: proc.terminate()
+            except Exception: pass
+
+    def _parse_qos_show(self, iface):
+        rc, out, _ = run_cmd(f"ovs-appctl qos/show {shlex.quote(iface)}")
+        if rc != 0 or not out.strip():
+            return None
+        # formato: seções "Default:" e "Queue 1:" etc.
+        stats = {}
+        cur = None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Default:"):
+                cur = "q0"
+            elif line.startswith("Queue "):
+                # "Queue 1:" => q1
+                qn = line.split()[1].rstrip(":")
+                cur = f"q{qn}"
+            elif "tx_packets:" in line and cur:
+                stats.setdefault(cur, {})["tx_packets"] = int(line.split(":")[1].strip())
+            elif "tx_bytes:" in line and cur:
+                stats.setdefault(cur, {})["tx_bytes"] = int(line.split(":")[1].strip())
+        return stats or None
+
+    def _qos_sampler(self):
+        last = {}
+        while not self._policy_stop:
+            ts = time.time()
+            for itf in self.interfaces:
+                st = self._parse_qos_show(itf)
+                if not st:
+                    # fallback tc -s
+                    rc, out, _ = run_cmd(f"tc -s qdisc show dev {shlex.quote(itf)}")
+                    if rc == 0 and "htb" in out:
+                        _append_jsonl(os.path.join(self.run_dir, f"qos_{itf}.jsonl"), {"ts": ts, "raw": out})
+                    continue
+                rec = {"ts": ts, **st}
+                _append_jsonl(os.path.join(self.run_dir, f"qos_{itf}.jsonl"), rec)
+            hub.sleep(max(1, self.poll_seconds))
 
     def _read_kpi_snapshot(self):
         """Copia métricas atuais sob lock."""
         with self._kpi_lock:
             return (self._kpi_count, self._kpi_jitter_p95_ms, self._kpi_loss_pct, self._kpi_bitrate_mbps)
 
+    def _read_video_bitrate(self):
+        with self._vid_lock:
+            return self._vid_bitrate_mbps
 
     # ---------- Policy loop ----------
 
@@ -472,6 +627,7 @@ class UcvController(app_manager.RyuApp):
         self._current_profile = None
         self._last_state = None
         self._last_change_ts = 0.0
+        init_state = self.qos_init_profile 
 
         while not self._policy_stop:
             try:
@@ -489,24 +645,25 @@ class UcvController(app_manager.RyuApp):
                     continue
 
                 # comece do estado anterior (não force baseline por default)
-                state = self._last_state or "baseline"
+                state = self._last_state or init_state
 
                 if self.detection_mode == "netem":
                     state = "degraded" if any(has_netem(itf) for itf in self.interfaces) else "baseline"
 
                 elif self.detection_mode == "kpi":
-                    n, jit, loss, br = self._read_kpi_snapshot()
+                    n, jit, loss, br_c2 = self._read_kpi_snapshot()
+                    vid_br = self._read_video_bitrate()
                     now = time.time()
 
                     def _degrade_condition():
                         cond_jl = (jit > self.kpi_degrade_jit) or (loss > self.kpi_degrade_loss)
-                        cond_br = (self.kpi_degrade_bps > 0.0) and (br < self.kpi_degrade_bps)
+                        cond_br = (self.kpi_degrade_bps > 0.0) and (vid_br < self.kpi_degrade_bps)
                         cond_ct = (getattr(self, "_kpi_continuity_up_pct", 100.0) < self.kpi_cont_uptime_target) if self.kpi_cont_uptime_target > 0 else False
                         return cond_jl or cond_br or cond_ct
 
                     def _recover_condition():
                         cond_jl = (jit < self.kpi_recover_jit) and (loss < self.kpi_recover_loss)
-                        cond_br = (self.kpi_recover_bps <= 0.0) or (br >= self.kpi_recover_bps)
+                        cond_br = (self.kpi_recover_bps <= 0.0) or (vid_br >= self.kpi_recover_bps)
                         cond_ct = (getattr(self, "_kpi_continuity_up_pct", 100.0) >= self.kpi_cont_uptime_target) if self.kpi_cont_uptime_target > 0 else True
                         return cond_jl and cond_br and cond_ct
 
@@ -535,7 +692,24 @@ class UcvController(app_manager.RyuApp):
                     for itf, (q0, q1) in qmap.items():
                         set_queue_rates(q0, prof.get("q0_min", 0), prof.get("q0_max", 0))
                         set_queue_rates(q1, prof.get("q1_min", 0), prof.get("q1_max", 0))
+
+                    # trilha de mudança
+                    n, jit, loss, br_c2 = self._read_kpi_snapshot()
+                    vid_br = self._read_video_bitrate()
+                    change = {
+                        "ts": time.time(),
+                        "new_state": state,
+                        "profile": prof,
+                        "kpi_snapshot": {
+                            "n": n, "jitter_p95_ms": jit, "loss_pct": loss,
+                            "bitrate_c2_mbps": br_c2, "bitrate_video_mbps": vid_br,
+                            "continuity_uptime_pct": getattr(self, "_kpi_continuity_up_pct", None)
+                        }
+                    }
+                    _append_jsonl(os.path.join(self.run_dir, "profile_changes.jsonl"), change)
+
                     self._last_state = state
+
 
             except Exception as e:
                 self.logger.exception("[policy] loop error: %s", e)
@@ -547,6 +721,12 @@ class UcvController(app_manager.RyuApp):
     def close(self):
         self._policy_stop = True
         hub.sleep(0.1)
+        for p in getattr(self, "_pcap_procs", []):
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
 
         # ---------- Helpers de portas ----------
     def _get_ofport(self, ifname: str):

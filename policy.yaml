@@ -7,10 +7,17 @@ interfaces: [s1-eth1, s1-eth2, s1-eth3, s1-eth4]  # [C2_host, C2_uav, VID_host, 
 qos_init_profile: baseline   # ou "degraded" para iniciar já apertado
 poll_seconds: 2
 iface_c2: "s1-eth1" # porta OVS de referência para C2 (proxy de métricas on-line)
+iface_video: "s1-eth3"
+
+run_dir: "logs"                 # opcional; se vazio, usa UCV_RUN_DIR ou /tmp/runs/<ts>_controller
+pcap_enable: true
+video_export_jsonl_path: "logs"   # se vazio, cai em <run_dir>/controller_video_kpi.jsonl
 
 #filtro unidirecional para amostrar apenas UAV -> HOST (uplink)
 c2_src_ip: "10.0.0.2"     # IP do UAV (origem dos pacotes)
 c2_dst_ip: "10.0.0.254"   # IP do HOST/QGC (destino dos pacotes)
+video_src_ip: "10.1.0.2"
+video_dst_ip: "10.1.0.254"
 
 # Taxa esperada de mensagens C2/MAVLink (Hz) – determina o período T (=1000/f) em ms.
 # Basilar: dimensionamento de controle de voo e C2 (ref. DO-362A / FAA TSO-C213a: metas de latência/continuidade dependem da aplicação/classe).
@@ -33,7 +40,7 @@ kpi:
   continuity_min_uptime_pct: 99.5
 
   # export em JSONL para gráficos/relato.
-  export_jsonl_path: /tmp/ucv_kpi.jsonl
+  export_jsonl_path: logs/ucv_kpi.jsonl
 
   # Perda p95 (%) para entrar/sair de degradado – mantenha histerese.
   # Basilar: perda de pacote (RFC 2680) e continuidade de serviço (EUROCONTROL DLP metrics).
@@ -51,13 +58,20 @@ kpi:
 
 # perfis de filas (HTB): q0 = EF/C2, q1 = AF/Vídeo
 qos_profiles:
-  baseline:
-    q0_min: 2000000    # 2 Mb/s min para C2
-    q0_max: 5000000    # 5 Mb/s max
-    q1_min: 500000     # 0.5 Mb/s min para vídeo
-    q1_max: 98000000   # ~98 Mb/s max (sem apertar)
-  degraded:
-    q0_min: 4000000    # prioriza C2 quando degradado
-    q0_max: 8000000
-    q1_min: 200000     # aperta vídeo (não deixa varrer o link)
-    q1_max: 5000000
+  baseline:         # operação normal
+    q0_min: 1000000     # 1 Mb/s
+    q0_max: 4000000     # 4 Mb/s
+    q1_min: 1000000     # 1 Mb/s
+    q1_max: 60000000    # 60 Mb/s
+
+  degraded:         # eventos esperados (congestão, rajadas moderadas)
+    q0_min: 4000000     # 4 Mb/s
+    q0_max: 8000000     # 8 Mb/s
+    q1_min: 300000      # 0.3 Mb/s
+    q1_max: 5000000     # 5 Mb/s
+
+  emergency:        # eventos severos (outage parcial, perda/jitter extremos)
+    q0_min: 6000000     # 6 Mb/s
+    q0_max: 12000000    # 12 Mb/s
+    q1_min: 0
+    q1_max: 2000000     # 2 Mb/s

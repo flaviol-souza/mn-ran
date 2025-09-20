@@ -9,7 +9,7 @@ UCV Mininet Experiment:
 - Controlador SDN: Ryu (RemoteController), OF 1.3
 """
 
-import os, sys, time, subprocess, argparse, threading
+import os, sys, time, subprocess, argparse, threading, json
 from pathlib import Path
 
 try:
@@ -25,6 +25,16 @@ from mininet.cli import CLI
 from mininet.log import setLogLevel, info
 
 # ---------- Helpers ----------
+
+def make_run_dir(events_path=None, run_dir=None):
+    if run_dir:
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        return run_dir
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    base = Path(events_path).stem if events_path else "manual"
+    rd = f"/tmp/runs/{ts}_{base}"
+    Path(rd).mkdir(parents=True, exist_ok=True)
+    return rd
 
 def sh(cmd: str, shell=True, check=True):
     """Run a shell command with nice logging."""
@@ -132,7 +142,15 @@ def apply_netem(intf: str, params: dict, action='add'):
     cmd = netem_cmd(intf, delay, jitter, loss, rate, action=('change' if action=='change' else 'add'))
     sh(cmd)
 
-def run_events(events_file: str, iface_map: dict, host_map: dict, start_time: float):
+def log_event(run_dir, t, action, target, params=None):
+    rec = {"ts": float(t), "action": action, "target": target, "params": params or {}}
+    try:
+        with open(os.path.join(run_dir, "events.jsonl"), "a") as fp:
+            fp.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+def run_events(events_file: str, iface_map: dict, host_map: dict, start_time: float, run_dir: str):
     """
     Lê events.yaml e aplica netem/cortes conforme timeline.
     Formato exemplo:
@@ -191,6 +209,7 @@ def run_events(events_file: str, iface_map: dict, host_map: dict, start_time: fl
         if ev.get('clear'):
             info(f'*** [{t:.2f}s] CLEAR netem em {intf}\n')
             apply_netem_on(host, intf, {}, action='del')
+            log_event(run_dir, t, "CLEAR", ev.get('target') or intf)
         else:
             params = ev.get('netem', {})
             info(f'*** [{t:.2f}s] APPLY netem em {intf}: {params}\n')
@@ -198,6 +217,7 @@ def run_events(events_file: str, iface_map: dict, host_map: dict, start_time: fl
             rc = host.cmd(f"tc qdisc show dev {intf} | grep -q netem ; echo $?").strip()
             action = 'change' if rc == '0' else 'add'
             apply_netem_on(host, intf, params, action=action)
+            log_event(run_dir, t, "APPLY", ev.get('target') or intf, params)
 
 def main():
     parser = argparse.ArgumentParser(description="UCV Mininet Experiment")
@@ -213,7 +233,12 @@ def main():
     parser.add_argument('--video_dest_ip', default='10.1.0.254')
     parser.add_argument('--video_dest_port', type=int, default=5600)
 
+    parser.add_argument('--run_dir', type=str, default=None, help='Diretório da rodada para salvar logs (default: /tmp/runs/<ts>_<basename(yaml)>)')
+
     args = parser.parse_args()
+
+    RUN_DIR = make_run_dir(args.events, args.run_dir)
+    print(f"*** Run dir: {RUN_DIR}")
 
     # --- Pré-clean para evitar "RTNETLINK: File exists" ao recriar a topo ---
     info('*** Pre-clean Mininet/OVS/ifaces\n')
@@ -238,7 +263,7 @@ def main():
     })
     init_profile = policy.get("qos_init_profile", "baseline")
     profile = qos_profiles.get(init_profile, list(qos_profiles.values())[0])
-
+    run_dir = policy.get("run_dir", "logs")
     # portas nas quais aplicar QoS (mesmas do controller/policy)
     qos_ifaces = policy.get("interfaces", ["s1-eth1","s1-eth2","s1-eth3","s1-eth4"])
 
@@ -319,7 +344,7 @@ def main():
             f"socat -dd -u "
             f"UDP4-RECV:{args.video_listen_port},bind=127.0.0.1,reuseaddr,so-rcvbuf=2097152 "
             f"UDP4-SENDTO:{args.video_dest_ip}:{args.video_dest_port},bind={uav_video_ip} "
-            "2>/tmp/ucv_video_socat.log;"
+            f"2>{RUN_DIR}/video_socat.log;"
         )
         info(f'*** Iniciando relé de vídeo no UAV: {socat_cmd}\n')
         p = uav.popen(socat_cmd, shell=True)
@@ -329,7 +354,7 @@ def main():
     if args.events and Path(args.events).exists():
         info(f'*** Carregando eventos de {args.events}\n')
         t0 = time.time()
-        th = threading.Thread(target=run_events, args=(args.events, iface_map, host_map, t0), daemon=True)
+        th = threading.Thread(target=run_events, args=(args.events, iface_map, host_map, t0, run_dir), daemon=True)
         th.start()
     else:
         info('*** Sem arquivo de eventos; execução contínua.\n')
