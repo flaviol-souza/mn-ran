@@ -61,6 +61,9 @@ def apply_netem_on(host, intf: str, params: dict, action='add'):
         seed=params.get('seed'),
         action=('change' if action=='change' else 'add')
     )
+    info(f'*** $ {cmd}\n')
+    #tc qdisc add dev root-eth0 root netem loss 100.0%
+    # tc qdisc add dev ucv_to_gcs root netem loss 100%
     host.cmd(cmd)
 
 def apply_qos_ovs(bridge: str, ifaces, rates):

@@ -193,7 +193,8 @@ class UcvController(app_manager.RyuApp):
         self.c2_dst_ip     = self.policy.get("c2_dst_ip", None)  # HOST/QGC   
 
         # período do C2 em ms
-        T_ms = 1000.0 / max(1e-6, self.c2_rate_hz)
+        #T_ms = 1000.0 / max(1e-6, self.c2_rate_hz)
+        T_ms = 1000.0 / self.c2_rate_hz  # ex.: 125 ms @ 8 Hz
 
         # ler multiplicadores (se existirem)
         enter_mult = float(ent.get("jitter_T_mult", 0.0))
@@ -447,11 +448,11 @@ class UcvController(app_manager.RyuApp):
         window_s = window_ms / 1000.0
 
         # Filtro BPF **direcional** (UAV -> HOST)
-        bpf = "udp port 14550"
-        if self.c2_src_ip:
-            bpf = f"udp dst port 14550 and src host {self.c2_src_ip}"
-            if self.c2_dst_ip:
-                bpf += f" and dst host {self.c2_dst_ip}"
+        bpf = "udp src port 14550 and dst host 10.0.0.254" #"udp port 14550"
+        #if self.c2_src_ip:
+        #    bpf = f"udp dst port 14550 and src host {self.c2_src_ip}"
+        #    if self.c2_dst_ip:
+        #        bpf += f" and dst host {self.c2_dst_ip}"
 
         # tshark disponível?
         if shutil.which("tshark") is None:
@@ -518,25 +519,46 @@ class UcvController(app_manager.RyuApp):
 
                 # atualiza ~10 Hz
                 now = ts
+                start = ts - window_s  
                 if (now - last_stats_ts) >= 0.2:
                     last_stats_ts = now
                     n = len(times)
-
+                    ts_list = list(times)
+                    n_packets = len(ts_list)
                     # jitter p95 (ms) sobre inter-arrivals
-                    if n >= 3:
-                        diffs = [ (times[i] - times[i-1]) * 1000.0 for i in range(1, n) ]
-                        diffs.sort()
-                        outage_time_s = sum(d/1000.0 for d in diffs if d >= self.kpi_gap_ms)
-                        continuity_uptime_pct = max(0.0, 100.0 * (window_s - outage_time_s) / window_s)
-                        k = (len(diffs) - 1) * 0.95
-                        f = math.floor(k); c = math.ceil(k)
-                        if f == c:
-                            jitter_p95 = diffs[int(k)]
-                        else:
-                            jitter_p95 = diffs[f] + (diffs[c] - diffs[f]) * (k - f)
-                    else:
+                    if len(ts_list) == 0:
+                        continuity_uptime_pct = 0.0         # outage total na janela
                         jitter_p95 = 0.0
-                        continuity_uptime_pct = 100.0
+                    else:
+                        # 2) Construir fronteiras da janela: [start] + amostras + [now]
+                        #    e recortar os intervalos à janela antes de somar
+                        boundaries = [start] + ts_list + [now]
+
+                        # jitter p95 (se quisermos manter)
+                        if len(ts_list) >= 3:
+                            diffs_ms = [ (ts_list[i] - ts_list[i-1]) * 1000.0 for i in range(1, len(ts_list)) ]
+                            diffs_ms.sort()
+                            k = (len(diffs_ms) - 1) * 0.95
+                            f = math.floor(k); c = math.ceil(k)
+                            jitter_p95 = diffs_ms[int(k)] if f == c else (diffs_ms[f] + (diffs_ms[c] - diffs_ms[f]) * (k - f))
+                        else:
+                            jitter_p95 = 0.0
+
+                        # 3) Somar “tempo de indisponibilidade” (outage) na janela:
+                        #    um sub-intervalo é considerado OUTAGE se o inter-arrival correspondente excede gap_ms.
+                        outage_s = 0.0
+                        for i in range(1, len(boundaries)):
+                            a, b = boundaries[i-1], boundaries[i]         # segmento recortado à janela
+                            inter_ms = (b - a) * 1000.0
+                            if inter_ms >= self.kpi_gap_ms:
+                                # opcional: considerar só o excesso acima do gap
+                                # outage_s += max(0.0, (inter_ms - gap_ms)) / 1000.0
+                                # mais simples (binário): todo o trecho conta como outage
+                                outage_s += (b - a)
+
+                        # 4) Converter para continuidade na janela
+                        outage_s = min(max(outage_s, 0.0), window_s)
+                        continuity_uptime_pct = max(0.0, 100.0 * (window_s - outage_s) / window_s)
 
                     # perda estimada (%) vs taxa esperada
                     expected = max(1.0, self.c2_rate_hz * window_s)
@@ -557,10 +579,11 @@ class UcvController(app_manager.RyuApp):
                         _append_jsonl(self.kpi_export, {
                             "ts": now,
                             "n": n,
+                            "n_packets": int(n_packets),
                             "jitter_p95_ms": float(jitter_p95),
                             "loss_pct": float(loss_pct),
                             "bitrate_mbps": float(bitrate_mbps),
-                            "continuity_uptime_pct": float(continuity_uptime_pct)
+                            "continuity_pct": float(continuity_uptime_pct)
                         })
 
         except Exception as e:
@@ -643,7 +666,9 @@ class UcvController(app_manager.RyuApp):
                 cur = f"q{qn}"
                 stats.setdefault(cur, {})
             elif cur:
-                if "min-rate:" in line:
+                if "burst:" in line:
+                    stats[cur]["burst"] = int(line.split(":")[1].strip())
+                elif "min-rate:" in line:
                     stats[cur]["min_rate"] = int(line.split(":")[1].strip())
                 elif "max-rate:" in line:
                     stats[cur]["max_rate"] = int(line.split(":")[1].strip())
@@ -651,6 +676,8 @@ class UcvController(app_manager.RyuApp):
                     stats[cur]["tx_packets"] = int(line.split(":")[1].strip())
                 elif "tx_bytes:" in line:
                     stats[cur]["tx_bytes"] = int(line.split(":")[1].strip())
+                elif "tx_errors:" in line:
+                    stats[cur]["tx_errors"] = int(line.split(":")[1].strip())
 
         # Preenche zeros se counters não existirem
         for k in list(stats.keys()):
@@ -660,10 +687,12 @@ class UcvController(app_manager.RyuApp):
         return stats or None
 
     def _qos_sampler(self):
-        last = {}
+        interfaces_kpi = self.interfaces.copy()
+        interfaces_kpi["interfaces"].append(self.video_if)
+        interfaces_kpi["interfaces"].append(self.kpi_if)
         while not self._policy_stop:
             ts = time.time()
-            for itf in self.interfaces:
+            for itf in interfaces_kpi:
                 st = self._parse_qos_show(itf)
                 if not st:
                     # fallback tc -s
